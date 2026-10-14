@@ -353,6 +353,79 @@ describe('inline text editing', () => {
     expect(bodyOf(host, 'text-1').querySelector('.katex-display')).not.toBeNull();
   });
 
+  it('does not store the fitted size a join copies onto text in an auto-fit box', () => {
+    // Found by the list fuzz's short auto-fit box: Backspace at the start of a
+    // paragraph, and Chromium wraps the joined text in the box's fitted size.
+    const { store, canvas, host } = setup();
+    store.select(['text-1']);
+    store.updateSelected((el) => {
+      if (el.type === 'text') {
+        el.html = '<p>gamma</p><p>delta</p>';
+        el.autoFit = true;
+      }
+    });
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    // What a fit leaves on the box, then what Chromium's join leaves in it.
+    body.style.fontSize = '13.8px';
+    body.dataset.fittedFontSize = '13.8';
+    body.innerHTML = '<p>gamma<span style="font-size: 13.8px;">delta</span>'
+      + '<span style="font-size: 20px;">authored</span></p>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+    body.dispatchEvent(new FocusEvent('blur'));
+
+    const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect(saved.type === 'text' && saved.html)
+      .toBe('<p>gammadelta<span style="font-size: 20px;">authored</span></p>');
+  });
+
+  it('does not store the fitted size a cut carried to the clipboard', () => {
+    // Found by the list fuzz's short auto-fit box: text cut while the box was
+    // fitted to 13.2px reached the clipboard wearing 13.2px, and pasted back
+    // after the box refitted to 14.6px it stayed at 13.2px.
+    const { store, canvas, host } = setup();
+    store.select(['text-1']);
+    store.updateSelected((el) => {
+      if (el.type === 'text') {
+        el.html = '<p>alpha</p><p>beta</p>';
+        el.autoFit = true;
+      }
+    });
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    body.style.fontSize = '13.2px';
+    body.dataset.fittedFontSize = '13.2';
+    const range = document.createRange();
+    range.selectNodeContents(body.querySelector('p')!);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    body.dispatchEvent(new Event('cut', { bubbles: true }));
+
+    // The box refits; then the paste lands what Chromium serialized.
+    body.style.fontSize = '14.6px';
+    body.dataset.fittedFontSize = '14.6';
+    const paste = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, 'clipboardData', {
+      value: { getData: (type: string) => (type === 'text/plain' ? 'alpha' : '<p style="font-size: 13.2px;">alpha</p>') },
+    });
+    body.dispatchEvent(paste);
+    body.innerHTML = '<p>beta</p><p style="font-size: 13.2px;">alpha</p>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste', bubbles: true }));
+    // A later paste of other text keeps whatever size it brings.
+    const other = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(other, 'clipboardData', {
+      value: { getData: (type: string) => (type === 'text/plain' ? 'gamma' : '') },
+    });
+    body.dispatchEvent(other);
+    body.innerHTML += '<p><span style="font-size: 13.2px;">gamma</span></p>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste', bubbles: true }));
+    body.dispatchEvent(new FocusEvent('blur'));
+
+    const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect(saved.type === 'text' && saved.html)
+      .toBe('<p>beta</p><p>alpha</p><p><span style="font-size: 13.2px;">gamma</span></p>');
+  });
+
   it('never stores data: media in a text element, whatever put it in the DOM', () => {
     // The backstop under every input path (paste, drop, execCommand): a
     // 10 MB data: video pasted into a title once made deck.json 13.5 MB.

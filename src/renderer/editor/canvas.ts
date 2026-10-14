@@ -28,7 +28,8 @@ import { expandTimeline } from '@shared/timeline.js';
 import { mapTextOffset, mergeTextHtml } from '@shared/textMerge.js';
 import {
   BASELINE_RUN_FONT_SIZE, isRelativeFontSize, restoreKatexSourceHtml,
-  pastedHtmlHasMedia, sanitizePastedTextHtml, stripLayoutDeclarations, stripTextMediaPayloads,
+  pastedHtmlHasMedia, sanitizePastedTextHtml, stripFittedFontSize, stripLayoutDeclarations,
+  stripTextMediaPayloads,
   textOnlyPastedHtml,
 } from '@shared/htmlSafety.js';
 import { isBaselineFormat, type BaselineFormat, type InlineTextFormat } from './textFormatting.js';
@@ -425,6 +426,17 @@ function textNodesIn(root: Node): Text[] {
   for (let node = walker.nextNode(); node; node = walker.nextNode()) texts.push(node as Text);
   return texts;
 }
+
+/**
+ * The size auto-fit had given the box text was last copied or cut from, with
+ * that text. Chromium serializes the copied runs with the editable root's
+ * inline `font-size` -- the fitted size of that moment -- so pasting them back
+ * after the box refitted, or into another box, froze them at it. A paste of
+ * the same text strips that size again (`stripFittedFontSize`).
+ */
+let copiedFit: { text: string; size: string } | null = null;
+
+const collapsedText = (value: string): string => value.replace(/[\s\u00a0\u200b\u2060]+/g, ' ').trim();
 
 /**
  * Turn every pending typing run that already holds typed text into the
@@ -3669,6 +3681,7 @@ export class EditorCanvas {
     const onPaste = (event: ClipboardEvent) => {
       const pasted = event.clipboardData?.getData('text/html') ?? '';
       const plainText = event.clipboardData?.getData('text/plain') ?? '';
+      pastedFit = copiedFit && collapsedText(plainText) === copiedFit.text ? copiedFit.size : null;
 
       // Pasting a URL onto selected text links that text rather than
       // replacing it, the way it works in Slack and every other chat app.
@@ -4060,6 +4073,8 @@ export class EditorCanvas {
      * Chromium splits the paragraph and re-established on the line it opens.
      */
     let breakFormats: TypingFormats | null = null;
+    /** The fitted size the text being pasted was copied at, if it came from an auto-fit box. */
+    let pastedFit: string | null = null;
     const onInput = (event?: Event) => {
       const typed = event instanceof InputEvent ? event : null;
       if (typed?.inputType === 'insertParagraph') {
@@ -4077,7 +4092,14 @@ export class EditorCanvas {
         // well, or the box saves an indent no control can reach. Plain typing
         // is left alone: it never restructures anything, and it is hot.
         stripLayoutDeclarations(body);
+        // In an auto-fit box the computed style a join copies includes the
+        // fitted size, which would freeze the moved text at it.
+        if (body.dataset.fittedFontSize !== undefined && body.style.fontSize) {
+          stripFittedFontSize(body, body.style.fontSize);
+        }
+        if (typed.inputType === 'insertFromPaste' && pastedFit) stripFittedFontSize(body, pastedFit);
       }
+      if (typed?.inputType === 'insertFromPaste') pastedFit = null;
       if (typed?.inputType.startsWith('delete')) {
         repairEmptiedBox();
         // Deleting a selection that spans a whole cell's text can take the
@@ -4362,7 +4384,12 @@ export class EditorCanvas {
     this.finishTextEdit = finish;
     body.addEventListener('beforeinput', onBeforeInput);
     // Before Chromium serializes the selection for the clipboard.
-    const onCopyOrCut = () => settleTypedMarkers(body);
+    const onCopyOrCut = () => {
+      settleTypedMarkers(body);
+      const size = body.dataset.fittedFontSize !== undefined ? body.style.fontSize : '';
+      const text = collapsedText(window.getSelection()?.toString() ?? '');
+      copiedFit = size && text ? { text, size } : null;
+    };
     body.addEventListener('copy', onCopyOrCut);
     body.addEventListener('cut', onCopyOrCut);
     body.addEventListener('input', onInput);
