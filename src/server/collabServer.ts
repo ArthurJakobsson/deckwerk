@@ -13,7 +13,7 @@ import { pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  createDeck, importAsset, importWebPage, loadDeck, loadTheme, resolveAsset, saveDeck,
+  createDeck, importAsset, importWebPage, loadDeck, loadTheme, originalAssetPath, resolveAsset, saveDeck,
 } from '../main/deckStore.js';
 import { exportDeck, webExportUnavailableReason } from '../main/exportDeck.js';
 import { capabilities } from '../shared/capabilities.js';
@@ -72,7 +72,7 @@ import { applyAgentTransaction, validateDeckIntegrity, type AgentOperation } fro
 import { NativeEditRequestSchema, applyNativeEdits, nativeEditContract } from '../shared/nativeEdits.js';
 import { type Comment, type Deck, type Slide, type SlideElement } from '../shared/deck.js';
 import { commentsAt, commentsOperation, findComment, threadEdits, threadIdOf } from '../shared/comments.js';
-import { classifyMediaName } from '../shared/media.js';
+import { classifyMediaName, originalDownloadName } from '../shared/media.js';
 import { deckOutline } from '../shared/deckDigest.js';
 import type { AgentPanelState } from '../shared/ipc.js';
 import type { LocalAgentLink, LocalAgentRegistry } from './localAgents.js';
@@ -1457,6 +1457,24 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
         return;
       }
       trackAssetResponse(request, response, identity?.login ?? null, `${assetMatch[1]}/${assetMatch[2]}`);
+      // "Download original": the file the author dropped, found beside the
+      // PNG or H.264 copy the slide shows, never a streaming rendition, and
+      // saved under the name it was dropped with.
+      if (url.searchParams.get('download') === 'original') {
+        let original: string;
+        try {
+          original = originalAssetPath(deckDirOf(assetMatch[1]), assetMatch[2]);
+        } catch {
+          response.writeHead(403, { 'content-type': 'text/plain' });
+          response.end('forbidden');
+          return;
+        }
+        await serveFileWithRanges(request, response, original, undefined, {
+          revalidate: true,
+          disposition: `attachment; filename="${sanitizeFilename(originalDownloadName(original))}"`,
+        });
+        return;
+      }
       // An oversized clip is served as its rendition once one exists, and as
       // itself until then — a slide that waits for a transcode is worse than
       // one that streams the original. The request is also what triggers the
@@ -4771,6 +4789,8 @@ interface ServeVariant {
   etagSalt?: string;
   /** The URL names these exact bytes (a pinned variant), so cache them for good. */
   immutable?: boolean;
+  /** A `Content-Disposition`, for a URL that is a download rather than media. */
+  disposition?: string;
 }
 
 /** Text the client bundle and decks are made of; media is already compressed. */
@@ -4846,6 +4866,7 @@ async function serveFileWithRanges(
     'accept-ranges': 'bytes',
     'cache-control': cacheControl,
     etag,
+    ...(variant.disposition ? { 'content-disposition': variant.disposition } : {}),
   };
 
   if (!range) {
