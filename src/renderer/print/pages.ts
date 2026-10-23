@@ -1,10 +1,10 @@
 import type { Deck, Slide } from '@shared/deck.js';
 import type { PdfBuildMode } from '@shared/ipc.js';
-import { resolveState, type SlideState } from '@shared/timeline.js';
+import { resolveState, stepCount, type SlideState } from '@shared/timeline.js';
 import { pdfSteps } from '@shared/pdfExport.js';
 import { renderSlide } from '../player/render.js';
 import { applyStaticSlideState } from '../player/staticState.js';
-import { holdVideoSource } from './readiness.js';
+import { holdVideoSource, showWebPagesAtStep } from './readiness.js';
 
 /**
  * Building the printable pages for a deck, shared by the two ways a PDF is
@@ -70,6 +70,7 @@ export function buildPrintPages(
       for (const video of stage.querySelectorAll('video')) holdVideoSource(video);
       page.appendChild(stage);
       container.appendChild(page);
+      showWebPagesAtStep(page, step, stepCount(slide));
       pages.push({ page, slide, state });
     }
   }
