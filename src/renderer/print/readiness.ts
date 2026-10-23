@@ -137,12 +137,105 @@ function deepImages(root: ParentNode): HTMLImageElement[] {
   return images;
 }
 
-/** Wait until a PDF page contains the same decoded assets and media frame as the player. */
-export async function waitForPdfPage(
-  page: HTMLElement,
-  slide: Slide,
-  state: SlideState,
+/**
+ * Keep a print page's video from loading until its turn comes.
+ *
+ * A long deck prints dozens of videos, some of them 4K, and every build stage
+ * of a slide repeats its clips. Mounted with a source, each one opens its own
+ * decoder at once: a 90-page talk took a tab past 4 GB and crashed Chromium's
+ * media thread. Taking the source away before the browser's resource
+ * selection runs (it waits for the current task to end) means nothing is
+ * fetched or decoded until waitForPdfDocument asks for it.
+ */
+export function holdVideoSource(video: HTMLVideoElement): void {
+  const src = video.getAttribute('src');
+  if (!src) return;
+  video.dataset.printSrc = src;
+  video.removeAttribute('src');
+  video.load();
+}
+
+function releaseVideoSource(video: HTMLVideoElement): void {
+  const src = video.dataset.printSrc;
+  if (!src) return;
+  delete video.dataset.printSrc;
+  video.src = src;
+}
+
+/**
+ * Show the still cut for this video in its place. False when the still does
+ * not arrive, so the caller can fall back to the video itself.
+ */
+async function replaceWithStill(video: HTMLVideoElement, url: string): Promise<boolean> {
+  const image = document.createElement('img');
+  image.className = video.className;
+  image.style.cssText = video.style.cssText;
+  // Same letterbox colour as a video surface (see freezeVideoFrame).
+  image.style.backgroundColor = 'black';
+  image.alt = '';
+  image.src = url;
+  // A still cut on demand can queue behind others; give it longer than an
+  // asset that only has to be read.
+  await Promise.race([eventOrTimeout(image, 'load', 30_000), eventOrTimeout(image, 'error', 30_000)]);
+  if (!image.naturalWidth) return false;
+  await image.decode().catch(() => {});
+  video.replaceWith(image);
+  return true;
+}
+
+export interface PdfReadinessOptions {
+  /**
+   * A URL for a still of deck video `src` at `time` seconds, cut outside the
+   * page (ffmpeg on the server or in the desktop's main process), or null to
+   * have this page load that video and capture the frame itself.
+   */
+  stillFor?: (src: string, time: number) => Promise<string | null>;
+  /** Called as videos settle, with how many are done out of how many. */
+  onProgress?: (settled: number, total: number) => void;
+}
+
+/** Stills are only image fetches; the server bounds its own ffmpeg work. */
+const STILL_CONCURRENCY = 4;
+
+async function settlePrintVideos(
+  pages: Array<{ page: HTMLElement; slide: Slide; state: SlideState }>,
+  options: PdfReadinessOptions,
 ): Promise<void> {
+  const videos = pages.flatMap(({ page, slide, state }) =>
+    [...page.querySelectorAll<HTMLVideoElement>('video')].map((video) => ({ video, slide, state })));
+  let settled = 0;
+  options.onProgress?.(0, videos.length);
+  // A video that has to play in the page is the expensive case: one at a time.
+  let live = Promise.resolve();
+  const oneLiveVideo = (task: () => Promise<void>): Promise<void> => {
+    const run = live.then(task);
+    live = run.catch(() => {});
+    return run;
+  };
+  const settleOne = async ({ video, slide, state }: typeof videos[number]): Promise<void> => {
+    const id = video.closest<HTMLElement>('[data-element-id]')?.dataset.elementId;
+    const element = slide.elements.find((candidate) => candidate.id === id);
+    const at = element?.type === 'video' ? state.seeks.get(element.id) ?? element.start : 0;
+    const url = element?.type === 'video' && options.stillFor
+      ? await options.stillFor(element.src, at).catch(() => null)
+      : null;
+    if (!url || !(await replaceWithStill(video, url))) {
+      await oneLiveVideo(async () => {
+        releaseVideoSource(video);
+        await settleVideo(video, at);
+        freezeVideoFrame(video);
+      });
+    }
+    options.onProgress?.(++settled, videos.length);
+  };
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(STILL_CONCURRENCY, videos.length) }, async () => {
+    while (next < videos.length) await settleOne(videos[next++]);
+  }));
+}
+
+/** Wait until a PDF page's images, embeds and web pages are as the player shows them. */
+async function waitForPdfPage(page: HTMLElement): Promise<void> {
   const images = deepImages(page);
   await Promise.all(images.map(freezeAnimatedImage));
   await Promise.all(images.map(settleImage));
@@ -155,21 +248,18 @@ export async function waitForPdfPage(
   // reveals itself on its own clock; print it once it has, or once its reveal
   // timeout has shown it as it is.
   await Promise.all([...page.querySelectorAll('.web-body')].map(whenWebElementReady));
-  await Promise.all([...page.querySelectorAll<HTMLVideoElement>('video')].map(async (video) => {
-    const id = video.closest<HTMLElement>('[data-element-id]')?.dataset.elementId;
-    const element = slide.elements.find((candidate) => candidate.id === id);
-    const at = element?.type === 'video' ? state.seeks.get(element.id) ?? element.start : 0;
-    await settleVideo(video, at);
-    freezeVideoFrame(video);
-  }));
 }
 
 /** Wait for font replacement, auto-fit, decoded media, and finite CSS motion. */
 export async function waitForPdfDocument(
   pages: Array<{ page: HTMLElement; slide: Slide; state: SlideState }>,
+  options: PdfReadinessOptions = {},
 ): Promise<void> {
   await document.fonts.ready;
-  await Promise.all(pages.map(({ page, slide, state }) => waitForPdfPage(page, slide, state)));
+  await Promise.all([
+    ...pages.map(({ page }) => waitForPdfPage(page)),
+    settlePrintVideos(pages, options),
+  ]);
   await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   for (const animation of document.getAnimations()) {
     const iterations = animation.effect?.getComputedTiming().iterations;

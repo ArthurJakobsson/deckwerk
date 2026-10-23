@@ -17,10 +17,12 @@ import {
 } from '../main/deckStore.js';
 import { exportDeck, webExportUnavailableReason } from '../main/exportDeck.js';
 import { capabilities } from '../shared/capabilities.js';
-import { getFfmpegPath, getFfprobePath, probeMedia } from '../main/ffmpeg.js';
+import { extractStillFrame, getFfmpegPath, getFfprobePath, probeMedia } from '../main/ffmpeg.js';
+import { createFrameCache } from '../main/frameCache.js';
 import { DeckWire } from './deckWire.js';
 import {
   RenditionStore,
+  defaultRenditionCacheDir,
   isVideoAsset,
   pruneRenditions,
   type RenditionOptions,
@@ -339,6 +341,11 @@ export interface CollabServerOptions {
    * turns it on, a desktop app sharing one deck has no imports to keep.
    */
   keepUploadsDays?: number;
+  /**
+   * Where the print tab's video stills are cached (`/api/video-still`).
+   * Defaults to a folder beside the rendition cache; tests pass their own.
+   */
+  printStillCacheDir?: string;
 }
 
 export interface RunningCollabServer {
@@ -408,6 +415,16 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       typeof options.mediaRenditions === 'object' ? options.mediaRenditions.cacheDir : undefined,
     ).catch(() => 0);
   }
+  /**
+   * Video stills for the print tab. A PDF needs one picture per video, never
+   * playback, and a browser asked to load every video in a long deck at once
+   * runs out of memory or crashes its media thread; ffmpeg cuts them here
+   * instead, three at a time, cached outside the decks.
+   */
+  const printStillDir = options.printStillCacheDir ?? join(dirname(defaultRenditionCacheDir()), 'print-stills');
+  const printStillFor = createFrameCache({ dir: () => printStillDir, extract: extractStillFrame });
+  // A still is a second of ffmpeg to recut; a month unused is long enough.
+  void pruneRenditions(printStillDir, 30 * 24 * 60 * 60 * 1000).catch(() => 0);
   // Kept as a local alias while the private panel transport is renamed. This
   // is only connection/activity state; DeckWerk never owns or invokes an agent.
   const sharedAgent = localAgents;
@@ -2401,6 +2418,32 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       } catch (error) {
         respondJson(response, 400, { error: String(error instanceof Error ? error.message : error) });
       }
+      return;
+    }
+
+    // One full-resolution frame of a deck video, for the print tab. 404 when
+    // no still can be cut (an alpha clip, a broken file): the tab then loads
+    // that one video itself.
+    if (path === '/api/video-still' && request.method === 'GET') {
+      const src = url.searchParams.get('src');
+      const time = Number(url.searchParams.get('t') ?? 0);
+      if (!src || !deckParam) return respondJson(response, 400, { error: 'missing deck or src' });
+      let absolute: string;
+      try {
+        absolute = resolveAsset(deckDirOf(deckParam), src);
+      } catch {
+        return respondJson(response, 403, { error: 'forbidden' });
+      }
+      if (!isVideoAsset(absolute)) return respondJson(response, 400, { error: 'not a video' });
+      const name = await printStillFor(absolute, time);
+      if (!name) return respondJson(response, 404, { error: 'no still for this video' });
+      const still = join(printStillDir, name);
+      response.writeHead(200, {
+        'content-type': 'image/jpeg',
+        'content-length': String(statSync(still).size),
+        'cache-control': 'private, max-age=300',
+      });
+      createReadStream(still).pipe(response);
       return;
     }
 
