@@ -1,6 +1,7 @@
 import type { Slide } from '@shared/deck.js';
 import type { SlideState } from '@shared/timeline.js';
-import { whenWebElementReady } from '../player/render.js';
+import { WEB_BRIDGE_SOURCE, type WebBridgeEvent } from '@shared/webBridge.js';
+import { WEB_REVEAL_TIMEOUT_MS, whenWebElementReady } from '../player/render.js';
 
 const eventOrTimeout = (target: EventTarget, event: string, timeout = 5_000): Promise<void> =>
   new Promise((resolve) => {
@@ -234,6 +235,66 @@ async function settlePrintVideos(
   }));
 }
 
+/**
+ * How long a web page gets to draw the step it was told before the PDF page
+ * is captured. Pages that take part in builds jump to the step they enter at,
+ * but some apply it only once their own loading is done, and a page entered
+ * at its first step plays its opening beats; the deck cannot see inside the
+ * sandboxed frame to know when that is over. 1.5 s caught a text-conditioning
+ * page's opening half drawn; 5 s matched the Player on every build stage of
+ * the TRI site-visit deck's eight web elements. Every page settles at once,
+ * so this is added to an export once, not per page.
+ */
+export const WEB_STEP_SETTLE_MS = 5_000;
+
+/** Settles once a print page's web element has had its step and time to draw it. */
+const webStepShown = new WeakMap<Element, Promise<void>>();
+
+/**
+ * Show each web page on a print page at that page's build step.
+ *
+ * A web element draws its own builds: the Player tells it the step when its
+ * slide comes on screen (`active`, which going backwards is the last step)
+ * and on every click after (`step`). A print page has no clicks, so it enters
+ * at its step, exactly as presenting backwards does — without this every
+ * printed copy sat at step 0, a chart of empty bars.
+ *
+ * Being told is not enough to draw: pages animate with requestAnimationFrame,
+ * which Chromium stops in a sandboxed frame scrolled out of view — and nearly
+ * every print page is. So while its web pages load and settle, the print page
+ * is held inside the viewport, invisible, with a spacer keeping its place in
+ * the preview (print.css). Call it as soon as `page` is in the document: the
+ * frames load from then, and a message sent earlier reaches the frame's blank
+ * initial document.
+ */
+export function showWebPagesAtStep(page: HTMLElement, step: number, steps: number): void {
+  const frames = [...page.querySelectorAll<HTMLIFrameElement>('iframe.web-frame')];
+  if (frames.length === 0) return;
+  const event: WebBridgeEvent = { source: WEB_BRIDGE_SOURCE, event: 'active', step, steps };
+  const spacer = document.createElement('div');
+  spacer.className = 'pdf-page-spacer';
+  spacer.style.width = page.style.width;
+  spacer.style.height = page.style.height;
+  page.before(spacer);
+  page.classList.add('web-settling');
+  const settled = Promise.all(frames.map((frame) => new Promise<void>((resolve) => {
+    // A page that never loads is printed as the reveal timeout leaves it.
+    const giveUp = setTimeout(resolve, WEB_REVEAL_TIMEOUT_MS + WEB_STEP_SETTLE_MS);
+    frame.addEventListener('load', () => {
+      frame.contentWindow?.postMessage(event, '*');
+      clearTimeout(giveUp);
+      setTimeout(resolve, WEB_STEP_SETTLE_MS);
+    }, { once: true });
+  }))).then(() => {
+    page.classList.remove('web-settling');
+    spacer.remove();
+  });
+  for (const frame of frames) {
+    const box = frame.closest('.web-body');
+    if (box) webStepShown.set(box, settled);
+  }
+}
+
 /** Wait until a PDF page's images, embeds and web pages are as the player shows them. */
 async function waitForPdfPage(page: HTMLElement): Promise<void> {
   const images = deepImages(page);
@@ -247,7 +308,10 @@ async function waitForPdfPage(page: HTMLElement): Promise<void> {
   // A live web page stays hidden (under its poster) until it is ready, and
   // reveals itself on its own clock; print it once it has, or once its reveal
   // timeout has shown it as it is.
-  await Promise.all([...page.querySelectorAll('.web-body')].map(whenWebElementReady));
+  await Promise.all([...page.querySelectorAll('.web-body')].map(async (box) => {
+    await whenWebElementReady(box);
+    await webStepShown.get(box);
+  }));
 }
 
 /** Wait for font replacement, auto-fit, decoded media, and finite CSS motion. */
