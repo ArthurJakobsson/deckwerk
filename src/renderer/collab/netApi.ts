@@ -1,7 +1,7 @@
 import type { AssetImportProgress, ImportedAsset, MediaInfo } from '@shared/ipc.js';
 import type { ClipboardWriteRequest } from '@shared/clipboard.js';
 import { clipboardImageName, type ClipboardImageSource } from '@shared/clipboardImages.js';
-import { pinMediaVariant } from './mediaVariants.js';
+import { pinMediaVariant, setMediaVariants } from './mediaVariants.js';
 
 /**
  * The browser collab client's stand-in for the Electron preload bridge.
@@ -48,7 +48,11 @@ function uploadFile(deck: string, file: File, token?: string): Promise<ImportedA
     }
     xhr.addEventListener('load', () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(xhr.response as ImportedAsset);
+        const imported = xhr.response as ImportedAsset & { variant?: string };
+        // The server names the clip's variant, so the element built for it
+        // asks for the URL it will keep.
+        if (imported.variant) setMediaVariants({ [imported.src]: imported.variant });
+        resolve(imported);
       } else {
         const body = xhr.response as { error?: string } | null;
         reject(new Error(body?.error ?? `upload failed (${xhr.status})`));
@@ -137,7 +141,9 @@ export function installNetApi(options: NetApiOptions): void {
           body: JSON.stringify({ url: url.href, deckAsset: true }),
         });
         if (!response.ok) return null;
-        return (await response.json() as { src?: string }).src ?? null;
+        const imported = await response.json() as { src?: string; variant?: string };
+        if (imported.src && imported.variant) setMediaVariants({ [imported.src]: imported.variant });
+        return imported.src ?? null;
       } catch (err) {
         console.error(`Could not bring ${src} over from ${sourceDeck}:`, err);
         return null;
@@ -145,6 +151,27 @@ export function installNetApi(options: NetApiOptions): void {
     },
 
     assetUrl: (src: string): string => pinMediaVariant(src, deckAssetPath(options.deckId, src)),
+
+    /**
+     * One frame of a deck video, cut by the server (`/api/video-still`), for
+     * preview surfaces (previewPosterProvider.ts). Without it a thumbnail
+     * loads the clip itself to capture its frame: the original, as far in as
+     * the in-point, which for a recording shown from 10 s in is 12 MB read to
+     * paint one picture. Null when the server cannot cut one (an alpha clip),
+     * so the surface falls back to capturing in the page. The still is
+     * fetched once here and the `<img>` showing it reads it from the cache.
+     */
+    videoPoster: async (req: { src: string; time: number }): Promise<{ url: string | null }> => {
+      const url = `/api/video-still?deck=${deck}&src=${encodeURIComponent(req.src)}&t=${req.time}`;
+      try {
+        const response = await fetch(url);
+        if (!response.ok) return { url: null };
+        await response.arrayBuffer();
+        return { url };
+      } catch {
+        return { url: null };
+      }
+    },
 
     importAssetFiles: async (files: File[], progressToken?: string): Promise<ImportedAsset[]> => {
       const imported: ImportedAsset[] = [];

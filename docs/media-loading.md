@@ -98,9 +98,11 @@ never opens a media pipeline for a thumbnail. This is not a refinement: in
 Sept 2026 the create-and-tear-down churn of thumbnail pipelines on an
 81-video deck hit a lock inversion between Chromium's main and media threads
 and froze the editor window for good (`docs/confirmed-bugs.md`). The browser
-collab client has no provider and keeps the in-page capture; so does any
-element the provider cannot serve, whose source is restored and gated as
-before. Recovery (`previewFrameRecovery.ts`) leaves a pending element alone.
+collab client's provider is the server: `/api/video-still` cuts the frame with
+ffmpeg (cached beside the renditions), so a thumbnail costs one small JPEG
+rather than the clip read as far as its in-point — 12 MB of a screen recording
+shown from 10 s in. Any element the provider cannot serve keeps the in-page
+capture, its source restored and gated as before. Recovery (`previewFrameRecovery.ts`) leaves a pending element alone.
 
 The editor canvas and the Player keep real `<video>` elements: they play. A
 capture path (`holdFrame`) is skipped, and if a frame cannot be read (a tainted
@@ -133,7 +135,13 @@ The rules that keep it honest:
 - **Serving never waits.** `ready()` is synchronous and returns null rather
   than blocking; a slide streaming the original beats a slide waiting for
   ffmpeg. The request that missed queues the transcode for next time.
-- **One at a time.** A presenting machine is also the server.
+- **One at a time, a requested clip first.** A presenting machine is also
+  the server, so encodes run one at a time, in slide order. A clip somebody
+  asks for while it waits (it is on screen, someone pressed play) goes ahead
+  of everything still waiting, so nobody waits behind the other 29 clips of
+  a fresh import. The probe that decides whether a clip needs encoding runs
+  in its turn too: run ahead of the queue, probes racing each other decided
+  its order.
 - **Pending means revalidate.** While a rendition is merely intended, the
   original is served `public, no-cache` even under a content-hashed name: an
   immutable copy of the original would never be asked about again, and the
@@ -146,25 +154,47 @@ The rules that keep it honest:
   Chromium failed it with `PIPELINE_ERROR_DECODE`. The welcome therefore
   carries `mediaVariants` (`o<key>` original, `r<key>` rendition, per deck
   src), a `media` message announces each rendition as it lands, and the
-  browser clients pin the variant into every video URL (`?v=`;
-  `src/renderer/collab/mediaVariants.ts`). A pinned URL is answered with
-  exactly that variant and cached immutably; a video the client has not been
-  told about yet (just uploaded) pins a bare `o` and gets the original,
-  revalidated. Unpinned URLs (agents, print, older clients) behave as above.
-- **Keyed by name, size and mtime**, not by path, so renaming a deck or a
-  folder does not throw away an hour of encoding.
+  browser clients ask for exactly that variant
+  (`src/renderer/collab/mediaVariants.ts`): a keyed variant is the URL
+  `/media/<o|r><key>.<ext>`, answered with exactly those bytes and cached
+  immutably. A video the client has not been told about yet (just uploaded)
+  pins a bare `o` on its deck URL and gets the original, revalidated. A deck
+  URL with a keyed `?v=` (a tab older than `/media`) is redirected there
+  permanently. Unpinned URLs (agents, print) behave as above. A change that
+  brings a clip into a deck is preceded by a `media` message with its
+  variant, and an upload's answer carries it, so no client builds an element
+  on a URL it will later abandon (orphaning what it downloaded under it).
+- **Keyed by content.** A talk starts as a copy of the last one; in Oct 2026
+  one 125 MB recording sat in five decks and was encoded once per copy. The
+  key is the start of the file's SHA-256, so one encode, one rendition and
+  one `/media` URL serve every copy, and a copy of a deck costs a browser
+  nothing it already has. Hashing never happens on the serving path: a file
+  is hashed when its deck opens (or it arrives) and the key is remembered
+  under its name, size and mtime in `content-keys.json` beside the
+  renditions, so a renamed deck costs nothing and a restart re-reads the
+  index. What an encode concluded survives a restart too: a rendition is a
+  file, and "none worth having" leaves `<key>.passed`. With access control
+  on, `/media` serves only someone who may see a deck holding that content.
 - **Never bigger than the source.** A rendition that came out larger is
   discarded and the original served; failure of any kind falls back to the
   original.
-- **Pruned after 90 days.** Every edited or deleted asset leaves its rendition
-  behind, and a server hosting years of talks would keep all of them. Losing
-  one that is still wanted costs a background re-encode and nothing else.
+- **Kept while any deck holds the clip.** Every edited or deleted asset
+  leaves its rendition behind, so what no deck folder holds any more is
+  pruned after 90 days (a deck in the trash may come back). A rendition of
+  content some deck still holds is never pruned, however long it went unasked
+  for: a talk not opened for a year must not stream originals the day it is
+  given again.
 
-Renditions are built when a deck is opened (in slide order, so the front of
-the talk is ready first) and on demand when an asset is requested. Neither is
-the right moment to discover a gigabyte of screen recordings, so there is also
-`npm run prepare:media -- <deck-or-decks-root>`, which does the whole job up
-front — what you want the day before a talk.
+Renditions are built as soon as a video reaches the server — a drop, paste or
+upload into the editor, a paste from another deck, a Keynote, PowerPoint or
+deck-archive import, an agent's mirror upload, an edit that brings a clip into
+a deck (which covers HTML an agent compiles) — and everything already on disk
+is swept once when the server starts (most recently edited deck first), so
+the first person to open a deck is not the one who streams its originals.
+Opening a deck and asking for a clip still queue it too. The sweep reads the
+deck folders, not deck.json, so a clip a deck holds but no longer shows is
+prepared and kept as well; the cost is one encode per content, once.
+`npm run prepare:media -- <deck-or-decks-root>` does the same up front.
 
 Measured after, cold, on the same 8 Mbit/s link: the 48 MB clip starts in
 0.8 s and the 51 MB one in 0.6 s. At 3 Mbit/s they start in under 2 s. The
@@ -366,6 +396,21 @@ accumulates decoded bitmaps from the rest of the deck.
   not, the 1080p cap, one transcode shared between racing callers, the cache
   key surviving a rename but not an edit, and the synchronous ready/pending
   answers the serving path depends on.
+- `test/mediaTransferBudgetBrowser.test.ts` — what a whole editing session
+  costs on the wire, measured by a throttled link in front of the server
+  (`test/support/throttledLink.ts`): no byte of a file arrives twice, reloads
+  and deck copies included; browsing again, editing, a collaborator's edit and
+  coming back from presenting re-download and revalidate nothing; a file keeps
+  one URL; a clip
+  waiting for its streaming version fetches only its frame, and once the
+  version exists costs at most one version more. Real Safari runs the same
+  budgets on a Mac with `RUN_SAFARI_MEDIA_BUDGET=1`.
+- `test/mediaIngest.test.ts` — every way a video reaches the server starts its
+  streaming encode at once; videos already on disk are swept at startup; one
+  encode serves every copy of the same bytes and survives restarts; a version
+  is kept while any deck uses its clip; a requested clip jumps the queue.
+  Budgets not met yet are `it.fails` under a PENDING note naming the change
+  that meets them.
 - `test/morph.test.ts` — the Morph panel's preview surfaces survive a
   re-render, and adopt their decoded elements when an edit rebuilds them.
 - `test/previewStillsBrowser.test.ts` — the real editor over a throttled link:
