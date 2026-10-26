@@ -4,6 +4,7 @@ import './editor.css';
 import '../collab/collab.css';
 import '../lightTheme.css';
 import { applyUiTheme } from '../uiTheme.js';
+import { applyUiScale } from '../uiScale.js';
 import { applyAgentOperations, applyAgentTransaction, type AgentOperation } from '@shared/agent.js';
 import type { Deck, SlideElement } from '@shared/deck.js';
 import { emptyDeck } from '@shared/deck.js';
@@ -28,8 +29,11 @@ import { CANVAS_NOTICE_EVENT, EditorCanvas } from './canvas.js';
 import { CssEditor } from './cssEditor.js';
 import { Inspector } from './inspector.js';
 import { HistoryPanel } from './historyPanel.js';
+import { ObjectList } from './objectList.js';
+import { MediaPanel, installMediaDrop } from './mediaPanel.js';
 import { authoredHtmlSync, fileName } from './htmlCompile.js';
-import { createShapeInsertPicker, createTableInsertPicker, insertText } from './elementCreation.js';
+import { createPenButton, createShapeInsertPicker, createTableInsertPicker, insertText } from './elementCreation.js';
+import { insertCode } from './codeInspector.js';
 import { createToolbarPicker, createToolbarSplitButton } from './exportPicker.js';
 import { showPdfExportDialog } from './pdfExportDialog.js';
 import { showWebExportDialog } from './webExportDialog.js';
@@ -40,8 +44,7 @@ import { persistSessionDeck } from './sessionPersistence.js';
 import { createThemePanel } from './themePanel.js';
 import {
   barButton,
-  barIconButton,
-  TEXT_ICON,
+  createTextInsertPicker,
   bindEditorKeys,
   createClipboardActions,
   makeContextActions,
@@ -49,6 +52,7 @@ import {
   type ShellDeps,
 } from './shellWiring.js';
 import { SlideRail } from './slideRail.js';
+import { createHistoryButton, createMediaButton, popoverPanelHost } from './toolbarPanels.js';
 import { installWindowApiPosterProvider } from '../player/previewPosterProvider.js';
 import { EditorStore } from './store.js';
 import { statusBarText } from './statusBar.js';
@@ -62,12 +66,14 @@ import { setRenderInvariantChecks } from './renderInvariants.js';
 import { setSelectionInvariantChecks } from './selectionInvariants.js';
 import { SpeakerNotesDrawer } from './speakerNotesDrawer.js';
 import { CanvasRulers, isRulersShortcut, toggleRulers } from './rulers.js';
+import { LightTable } from './lightTable.js';
 import { applySpeakerNotes } from '@shared/speakerNotes.js';
 import { installResponsiveToolbar } from './responsiveToolbar.js';
 import { setSlideColorSource } from './colorPicker.js';
 import { slideColors } from '@shared/slideColors.js';
 
 applyUiTheme();
+applyUiScale();
 
 /**
  * Editor shell: wires the panels to one store, owns the toolbar, the keyboard
@@ -153,6 +159,7 @@ new SpeakerNotesDrawer(el('canvas'), store, {
   onStatus: setStatusMessage,
 });
 new CanvasRulers(el('canvas'), canvas, store, { shortcutHint: 'Cmd/Ctrl+R' });
+new LightTable(el('canvas'), canvas, store);
 // Cmd/Ctrl+R shows and hides the rulers, as in Keynote, wherever focus is --
 // in the capture phase, because a text box being edited keeps its keys to
 // itself. Taking it also keeps Electron's default menu from reloading the
@@ -164,9 +171,29 @@ window.addEventListener('keydown', (event) => {
 }, true);
 const inspector = new Inspector(el('inspector'), store);
 new TimelinePanel(el('timeline'), store, new BuildPreview(canvas, store));
-new HistoryPanel(el('history'), store);
+// History is the deck's past, not the selection's: it opens from the deck
+// name in the toolbar rather than from a sidebar tab.
+const historyHost = popoverPanelHost('history');
+new HistoryPanel(historyHost, store);
+// The deck's media library opens from Media on the Insert bar: reusing a file
+// is inserting it, so it sits with Text, Shape and Table rather than in a tab.
+const mediaHost = popoverPanelHost('media');
+const mediaPanel = new MediaPanel(mediaHost, store, {
+  setStatusMessage,
+  beginOperation: (message) => operationProgress.begin(message),
+});
+installMediaDrop(el('canvas'), store, mediaPanel);
 const rail = new SlideRail(el('rail'), store);
 rail.onStatus = setStatusMessage;
+// The slide's objects, from a floating icon in the canvas's top-left corner,
+// as the speaker notes open from the bottom-left one: a drawer over the canvas
+// rather than a column of its own.
+const objectsDrawer = document.createElement('div');
+objectsDrawer.id = 'objects';
+objectsDrawer.className = 'objects-drawer';
+const objectList = new ObjectList(objectsDrawer, store);
+objectList.toggle.classList.add('objects-toggle');
+el('canvas').append(objectList.toggle, objectsDrawer);
 const editorBody = el('body');
 const railDivider = document.createElement('div');
 railDivider.className = 'panel-resize-divider panel-resize-rail';
@@ -467,6 +494,7 @@ async function placeSyncedSlides(
 
 /* --- toolbar --- */
 
+
 let deckNameLabel: HTMLElement | null = null;
 
 function barDivider(): HTMLElement {
@@ -539,6 +567,7 @@ function buildToolbar(): void {
   left.append(
     createDeckWerkButton(),
     deckNameLabel,
+    createHistoryButton(historyHost),
     barDivider(),
     fileActions,
     compactFile,
@@ -547,9 +576,15 @@ function buildToolbar(): void {
   const mid = document.createElement('div');
   mid.className = 'bar-group deck-only bar-center';
   mid.append(
-    barIconButton('Text', TEXT_ICON, () => addText()),
+    createTextInsertPicker({
+      textBox: () => addText(),
+      // A starter listing, selected, so typing replaces it.
+      codeBlock: () => { canvas.beginCodeEdit(insertCode(store).id, 'all'); },
+    }),
     createShapeInsertPicker(store),
+    createPenButton(canvas),
     createTableInsertPicker(store),
+    createMediaButton(mediaHost),
   );
 
   const right = document.createElement('div');
@@ -1002,7 +1037,6 @@ const PANELS = [
   { id: 'inspector', label: 'Props' },
   { id: 'themePanel', label: 'Design' },
   { id: 'timeline', label: 'Build' },
-  { id: 'history', label: 'History' },
 ] as const;
 
 function buildTabs(): void {

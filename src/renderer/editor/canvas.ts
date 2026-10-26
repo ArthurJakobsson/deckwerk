@@ -1,10 +1,43 @@
 import { openContextMenu } from './contextMenuPlacement.js';
-import type { Deck, Slide, SlideElement, TextEl } from '@shared/deck.js';
+import type { Deck, ShapeEl, Slide, SlideElement, TextEl } from '@shared/deck.js';
 import { NEW_MEDIA_FIT } from '@shared/deck.js';
 import { lineSpacingValue } from '@shared/lineHeight.js';
 import { canHoldText, shapeToTextBox } from '@shared/shapeText.js';
 import { flipped, moveCorner, polygonPoints } from '@shared/polygonShape.js';
 import { flipsOf } from '@shared/flip.js';
+import {
+  bendSegment,
+  constrainAngle,
+  drawnAtPixelScale,
+  freehandRun,
+  insertNode,
+  moveHandle,
+  moveNode,
+  nearestOnPath,
+  pathOnCanvas,
+  redrawPathAtSize,
+  removeNode,
+  serializePath,
+  toggleSmooth,
+  type SubPath,
+} from '@shared/pathNodes.js';
+import {
+  bendLine,
+  controlFromHandle,
+  editableRuns,
+  isLineFamily,
+  isTwoPointLine,
+  lineEndpoints,
+  lineFromEndpoints,
+  lineRun,
+  setEditableRuns,
+} from '@shared/lineFamily.js';
+import {
+  PEN_POINT_SCREEN_PX, PENCIL_TOLERANCE_SCREEN_PX, PenDraft, pathOverlay, penOverlay, pencilOverlay,
+  type DrawingTool, type OverlayKnob,
+} from './pathTools.js';
+import { newObjectColors } from '@shared/themes.js';
+import { insertPath } from './elementCreation.js';
 import { braceDepthToward, bracePolyline, braceTip } from '@shared/brace.js';
 import { type Rect, fitScale, makeId, snapAngle } from '@shared/geometry.js';
 
@@ -108,6 +141,9 @@ import { isWebBridgeAction } from '@shared/webBridge.js';
 import { reportSelectionViolations } from './selectionInvariants.js';
 import { COMPARE_CHIP_CLASS, compareChip } from './compareChip.js';
 import { KeptSelectionHighlight, TEXT_EDIT_PANEL_CHROME } from './keptSelection.js';
+import { prepareCodeBlocks, syncCodeBody } from '../player/codeRender.js';
+import { CODE_EDIT_CHROME, CodeEditor } from './codeEditing.js';
+import { CODE_LINE_HEIGHT, CODE_PADDING_EM, describeLines, isLineBuild } from '@shared/codeBlocks.js';
 import {
   HANDLES,
   type SizeGuide,
@@ -784,6 +820,8 @@ type ResizeOrigin = Rect & {
    * proportions, and is put back if Shift is let go mid-drag. */
   fit?: 'cover' | 'contain' | 'fill';
   control?: { x: number; y: number } | null;
+  /** A path drawn one unit to the pixel, which a resize redraws at the new size. */
+  path?: string;
 };
 
 type DragMode =
@@ -829,7 +867,40 @@ type DragMode =
     }
   | { kind: 'curve-control'; elementId: string }
   | { kind: 'brace-tip'; elementId: string }
-  | { kind: 'polygon-corner'; elementId: string; index: number };
+  | { kind: 'polygon-corner'; elementId: string; index: number }
+  | {
+      /** A point of the path being edited, or one of its handles (`which`). */
+      kind: 'path-point';
+      elementId: string;
+      sub: number;
+      index: number;
+      which: 'anchor' | 'in' | 'out';
+      startCanvas: XY;
+      /** The shape as it was when the drag began; every move starts from it. */
+      origin: ShapeEl;
+    }
+  | {
+      /**
+       * Bending the outline of the line or path being edited (Cmd/Ctrl-drag):
+       * the point at `t` on segment `segment` of run `sub` follows the pointer.
+       */
+      kind: 'path-bend';
+      elementId: string;
+      sub: number;
+      segment: number;
+      t: number;
+      /** Where on the outline the press landed. */
+      through: XY;
+      startCanvas: XY;
+      origin: ShapeEl;
+    };
+
+/**
+ * The canvas whose pen or point editing began last. The keys those modes
+ * answer are read from the window, and the Design workspace puts a second
+ * canvas on screen over the first; only this one answers them.
+ */
+let pathKeysOwner: EditorCanvas | null = null;
 
 /** Fired on the canvas host with a message (`detail`) for the shell's status bar. */
 export const CANVAS_NOTICE_EVENT = 'deckwerk-canvas-notice';
@@ -837,6 +908,8 @@ export const CANVAS_NOTICE_EVENT = 'deckwerk-canvas-notice';
 export class EditorCanvas {
   private store: EditorStore;
   private host: HTMLElement;
+  /** Typing into a code block on the slide (codeEditing.ts). */
+  private codeEditor: CodeEditor;
   private stage: HTMLElement;
   private slideLayer: HTMLElement;
   private overlay: HTMLElement;
@@ -1045,6 +1118,15 @@ export class EditorCanvas {
    * native event alone left double-click-to-play inert there.
    */
   private pendingMediaToggle: string | null = null;
+  /** Where the press that may open a code block's edit landed, for its caret. */
+  private pendingCodePoint: { clientX: number; clientY: number } | null = null;
+  /**
+   * A line or path whose points open when this press is let go without a
+   * drag: the second press of a double-click on it, read from the presses
+   * because the selection chrome drawn by the first lands under the pointer
+   * and Chromium then fires no dblclick at all.
+   */
+  private pendingPathEdit: string | null = null;
   /** When the pointer path last toggled media, so the native dblclick skips. */
   private mediaToggledAt = Number.NEGATIVE_INFINITY;
 
@@ -1062,6 +1144,36 @@ export class EditorCanvas {
   private playback: { shield: HTMLElement; frame: HTMLElement } | null = null;
   /** The crop as it was when the current mask drag began. */
   private maskOrigin: { x: number; y: number; w: number; h: number } | null = null;
+  /**
+   * The pen's drawing in progress (Shape → Draw with Pen). While there is one,
+   * every press on the canvas places a point; the deck changes only when the
+   * drawing is finished, as one new path shape.
+   */
+  private pen: PenDraft | null = null;
+  /**
+   * When the pen last finished an open line with a double-click. That
+   * gesture's own `dblclick` arrives afterwards and lands on the new path,
+   * where it would open its points for editing.
+   */
+  private penFinishedAt = Number.NEGATIVE_INFINITY;
+  /**
+   * The pencil, while it is out (Pen ▾ → Pencil, or Shift+P): the slide it
+   * draws on and the stroke under the pointer, in canvas coordinates. Each
+   * stroke becomes its own path when the pointer lifts, and the pencil stays
+   * out for the next one until Escape, Return or the button puts it down.
+   */
+  private pencil: { slideId: string; stroke: XY[] | null } | null = null;
+  /** Notified when the pen or the pencil is taken up or put down, so the toolbar can show it. */
+  onPenToolChange?: (tool: DrawingTool | null) => void;
+  /**
+   * The path shape whose points are being edited (double-click a path, or
+   * Edit points), and which of its points is selected: `sub` is the run,
+   * `index` the point in it. Like mask mode, this is the canvas's own state;
+   * the deck changes only as points are dragged, added and deleted.
+   */
+  private pathEdit: { elementId: string; point: { sub: number; index: number } | null } | null = null;
+  /** Notified when point editing starts or ends, so the inspector can relabel. */
+  onPathEditChange?: (elementId: string | null) => void;
 
   /** Notified when mask mode turns on or off, so the inspector can relabel. */
   onMaskModeChange?: (elementId: string | null) => void;
@@ -1090,6 +1202,16 @@ export class EditorCanvas {
   constructor(host: HTMLElement, store: EditorStore) {
     this.host = host;
     this.store = store;
+    this.codeEditor = new CodeEditor({
+      store,
+      chrome: host,
+      nodeFor: (id) => this.slideLayer.querySelector<HTMLElement>(`[data-element-id="${CSS.escape(id)}"]`),
+      redrawOverlay: () => {
+        const { deck, slideIndex, selection } = this.store.get();
+        const slide = deck.slides[slideIndex];
+        if (slide) this.drawOverlay(deck, slide.elements, selection);
+      },
+    });
 
     this.host.classList.add('canvas-host');
     this.stage = document.createElement('div');
@@ -1151,11 +1273,33 @@ export class EditorCanvas {
    * test for "did the content change".
    */
   render(): void {
+    this.renderSlide();
+    // A code block being typed into keeps its draft across the redraw.
+    this.codeEditor.afterRender();
+  }
+
+  private renderSlide(): void {
     // A render can replace the edited box's nodes out from under the
     // bookmark, or end the edit: either way the kept highlight is re-derived.
     this.keptSelection.schedule();
     const { deck, slideIndex, selection } = this.store.get();
     const slide = deck.slides[slideIndex];
+    // A drawing belongs to the slide it was begun on, and selecting anything
+    // (a click in the rail, a new text box) puts the pen down.
+    if (this.pen && (this.pen.slideId !== slide?.id || selection.size > 0)) this.endPen();
+    if (this.pencil && (this.pencil.slideId !== slide?.id || selection.size > 0)) this.endPencil();
+    // Point editing ends when its path stops being the one selected object:
+    // another selection, a slide change, an undo that took the path away.
+    if (this.pathEdit) {
+      const edited = slide?.elements.find((el) => el.id === this.pathEdit!.elementId);
+      const paths = edited ? editableRuns(edited) : null;
+      if (!paths || selection.size !== 1 || !selection.has(edited!.id)) {
+        this.pathEdit = null;
+        this.onPathEditChange?.(null);
+      } else if (this.pathEdit.point && !paths[this.pathEdit.point.sub]?.nodes[this.pathEdit.point.index]) {
+        this.pathEdit.point = null;
+      }
+    }
     if (!slide) {
       this.slideLayer.replaceChildren();
       this.overlay.replaceChildren();
@@ -1217,7 +1361,11 @@ export class EditorCanvas {
         {
           context: 'an in-place patch',
           // Live pages deliberately differ from the preview render.
-          skipElementIds: [...(this.editingId ? [this.editingId] : []), ...this.liveWebIds],
+          skipElementIds: [
+            ...(this.editingId ? [this.editingId] : []),
+            ...(this.codeEditor.editingId() ? [this.codeEditor.editingId()!] : []),
+            ...this.liveWebIds,
+          ],
         },
       );
       this.scheduleTableHeightSync();
@@ -1266,6 +1414,7 @@ export class EditorCanvas {
     }
 
     this.harvestVideos();
+    prepareCodeBlocks(this.store.get().deck);
     const rendered = renderSlide(
       slide,
       { resolveSrc: (src) => window.api.assetUrl(src), mediaPreload: 'metadata' },
@@ -1737,6 +1886,8 @@ export class EditorCanvas {
     const resolve = { resolveSrc: (src: string) => window.api.assetUrl(src) };
     const rendered = this.slideLayer.querySelector<HTMLElement>(':scope > .slide');
     if (rendered) applySlideRootStyles(rendered, slide, resolve);
+    // A theme change can take this path; the Deck code scheme follows it.
+    prepareCodeBlocks(this.store.get().deck);
 
     for (const el of slide.elements) {
       const node = this.slideLayer.querySelector<HTMLElement>(
@@ -1763,6 +1914,8 @@ export class EditorCanvas {
       // A shape's drawing is sized by its own viewBox, so the wrapper's new
       // box is not enough: rebuild the SVG for the current geometry.
       if (el.type === 'shape') syncShapeBody(node, el);
+      // A code block's lines are drawn from its fields; redraw when they change.
+      if (el.type === 'code') syncCodeBody(node, el);
     }
   }
 
@@ -1873,6 +2026,7 @@ export class EditorCanvas {
     this.placePlayback();
     this.onViewportChange?.();
     for (const listener of this.viewportListeners) listener();
+    this.codeEditor?.reposition();
   }
 
   /**
@@ -2123,7 +2277,8 @@ export class EditorCanvas {
 
   private bindViewportGestures(): void {
     this.host.addEventListener('wheel', (event) => {
-      if ((event.target as HTMLElement).closest('.zoom-controls, .notes-drawer')) return;
+      // Panels floating over the canvas scroll themselves; the slide stays put.
+      if ((event.target as HTMLElement).closest('.zoom-controls, .notes-drawer, .objects-drawer, .light-table')) return;
 
       // Chromium represents a macOS trackpad pinch as a wheel event with the
       // control modifier set, and a mouse wheel with Ctrl/Cmd held arrives
@@ -2208,7 +2363,7 @@ export class EditorCanvas {
   private beginViewportPan(ev: PointerEvent): boolean {
     if (ev.button !== 1 && !(ev.button === 0 && this.spacePan)) return false;
     const target = ev.target instanceof Element ? ev.target : null;
-    if (target?.closest('.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer')) return false;
+    if (target?.closest('.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .objects-toggle, .objects-drawer, .light-table')) return false;
     // No selection, no text selection, no focus change: a text box being
     // edited stays in its edit.
     ev.preventDefault();
@@ -2275,6 +2430,8 @@ export class EditorCanvas {
     elements: SlideElement[],
     selection: Set<string>,
   ): void {
+    // A code block being typed into is as tall as its draft, not its stored box.
+    elements = this.codeEditor.liveElements(elements);
     const frag = document.createDocumentFragment();
 
     // While the Build tab is open, number every element a build entry touches
@@ -2285,8 +2442,14 @@ export class EditorCanvas {
       // By-paragraph reveals get one badge per paragraph, pinned to the
       // paragraph's own line so each number matches its row in the panel.
       const paragraphNumbers = new Map<string, Array<{ part: number; num: number }>>();
+      // A code block's line builds get theirs beside the first line they act on.
+      const lineNumbers = new Map<string, Array<{ line: number; num: number }>>();
       (slide ? expandTimeline(slide) : []).forEach((unit, i) => {
-        if (unit.part !== null) {
+        if (slide && unit.action.lines && isLineBuild(unit, slide)) {
+          const list = lineNumbers.get(unit.action.target) ?? [];
+          list.push({ line: Number.parseInt(unit.action.lines, 10), num: i + 1 });
+          lineNumbers.set(unit.action.target, list);
+        } else if (unit.part !== null) {
           const list = paragraphNumbers.get(unit.action.target) ?? [];
           list.push({ part: unit.part, num: i + 1 });
           paragraphNumbers.set(unit.action.target, list);
@@ -2309,6 +2472,16 @@ export class EditorCanvas {
       for (const el of elements) {
         const numbers = numbersByElement.get(el.id);
         if (numbers) makeBadge(numbers.join(','), el.x + el.w, el.y);
+        const lineBuilds = lineNumbers.get(el.id);
+        if (lineBuilds) {
+          // Builds on the same line share one badge, as an object's do.
+          const byLine = new Map<number, number[]>();
+          for (const { line, num } of lineBuilds) byLine.set(line, [...(byLine.get(line) ?? []), num]);
+          for (const [line, nums] of byLine) {
+            const box = this.codeLineBox(el, line, line, stageRect);
+            makeBadge(nums.join(','), el.x + el.w, (box?.top ?? el.y) + 9);
+          }
+        }
         const parts = paragraphNumbers.get(el.id);
         if (!parts) continue;
         const content = this.stage.querySelector<HTMLElement>(
@@ -2378,6 +2551,25 @@ export class EditorCanvas {
       }
     }
 
+    // Lines picked in a code block's gutter, for a build on just those lines.
+    const picked = this.store.codeLineSelection();
+    if (picked && this.codeEditor.editingId() !== picked.elementId) {
+      const el = elements.find((candidate) => candidate.id === picked.elementId);
+      const box = el ? this.codeLineBox(el, picked.from, picked.to, this.stage.getBoundingClientRect()) : null;
+      if (el && box) {
+        const mark = document.createElement('div');
+        mark.className = 'code-line-pick';
+        mark.style.left = `${el.x}px`;
+        mark.style.top = `${box.top}px`;
+        mark.style.width = `${el.w}px`;
+        mark.style.height = `${box.height}px`;
+        mark.style.setProperty('--inv', String(1 / this.scale));
+        mark.dataset.lines = `${picked.from}-${picked.to}`;
+        mark.title = describeLines(Array.from({ length: picked.to - picked.from + 1 }, (_, i) => picked.from + i));
+        frag.appendChild(mark);
+      }
+    }
+
     for (const el of elements) {
       if (el.layoutMasterId) continue;
       if (!selection.has(el.id)) continue;
@@ -2397,6 +2589,14 @@ export class EditorCanvas {
       if (el.rot && !isLine) box.style.transform = `rotate(${el.rot}deg)`;
       // Counter-scale so outlines and handles stay one visual size at any zoom.
       box.style.setProperty('--inv', String(1 / this.scale));
+
+      // A path whose points are being edited shows those instead of its box
+      // (drawn below, over everything else).
+      if (this.pathEdit?.elementId === el.id) {
+        box.classList.add('path-editing');
+        frag.appendChild(box);
+        continue;
+      }
 
       // Lines, arrows and braces get endpoint handles instead of a resize
       // box: what you want to move is where the arrow starts and ends, not
@@ -2592,6 +2792,16 @@ export class EditorCanvas {
       }
     }
 
+    if (this.pen) frag.appendChild(penOverlay(this.pen, this.scale, deck.canvas));
+    if (this.pencil?.stroke) {
+      frag.appendChild(pencilOverlay(this.pencil.stroke, newObjectColors(deck).stroke, deck.canvas));
+    }
+    if (this.pathEdit) {
+      const edited = elements.find((el) => el.id === this.pathEdit!.elementId);
+      const paths = edited ? editableRuns(edited) : null;
+      if (edited && paths) frag.appendChild(this.pathEditOverlay(edited.id, paths, deck));
+    }
+
     if (this.marquee) {
       const m = document.createElement('div');
       m.className = 'marquee';
@@ -2621,6 +2831,7 @@ export class EditorCanvas {
         slideSelection: state.slideSelection,
         editingId: this.editingId,
         maskingId: this.maskingId,
+        pathEditId: this.pathEdit?.elementId ?? null,
         tableSelection: this.tableSelection,
         slideLayer: this.slideLayer,
         overlay: this.overlay,
@@ -2668,6 +2879,10 @@ export class EditorCanvas {
     document.fonts?.addEventListener?.('loadingdone', () => this.scheduleTableHeightSync());
     this.host.addEventListener('contextmenu', (ev) => this.onContextMenu(ev));
 
+    // Ahead of the shell's own shortcuts: while the pen is drawing, Return,
+    // Escape, Backspace and undo belong to the drawing; while a path's points
+    // are being edited, Delete removes a point and Escape or Return is done.
+    window.addEventListener('keydown', (ev) => this.onPathKey(ev), true);
     // Modifier state changes do not cause pointermove, so mirror the gesture
     // modifier onto the canvas host to let CSS swap the handle cursor while it
     // is hovered.
@@ -2722,7 +2937,7 @@ export class EditorCanvas {
     // are ordinary application controls. Capturing their pointer on the canvas
     // changes the pointer-up target and prevents Chromium from synthesising a
     // click, which made all three welcome actions appear inert.
-    if (target.closest(`.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .canvas-ruler, .${COMPARE_CHIP_CLASS}`)) return;
+    if (target.closest(`.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .objects-toggle, .objects-drawer, .light-table, .canvas-ruler, .${COMPARE_CHIP_CLASS}, .${CODE_EDIT_CHROME}`)) return;
     const slide = this.store.slide;
     if (!slide) return;
     // A press that reaches the canvas was not on a live page (the frame keeps
@@ -2758,6 +2973,16 @@ export class EditorCanvas {
     this.onPointerSample?.(point);
     this.host.setPointerCapture(ev.pointerId);
 
+    if (this.pen) {
+      this.penPointerDown(ev, point, secondClick);
+      return;
+    }
+    if (this.pencil) {
+      this.pencil.stroke = [point];
+      this.redrawOverlay();
+      return;
+    }
+
     // A click away from the active crop window is the implicit "Done" action.
     // Keep the click alive after leaving mask mode so it can still select the
     // object underneath (or begin a marquee on empty canvas). Mask handles are
@@ -2776,6 +3001,8 @@ export class EditorCanvas {
         this.toggleMaskMode(null);
       }
     }
+
+    if (this.pathEdit && this.pathEditPointerDown(ev, target, point, secondClick)) return;
 
     // Like Keynote, the gesture modifier (Command on macOS, Control elsewhere)
     // turns any ordinary object handle into a rotation handle. Curve controls
@@ -2903,6 +3130,9 @@ export class EditorCanvas {
             ...((selected.type === 'shape' && selected.control)
               ? { control: { ...selected.control } }
               : {}),
+            ...((selected.type === 'shape' && drawnAtPixelScale(selected))
+              ? { path: selected.path! }
+              : {}),
           });
         }
         this.drag = {
@@ -2945,6 +3175,19 @@ export class EditorCanvas {
 
     // Topmost element under the cursor wins, matching what you see.
     const hit = this.hitTest(point);
+    // A selected code block's gutter picks lines rather than moving the
+    // block: a click takes one line, Shift-click stretches to it.
+    if (hit?.type === 'code' && !ev.altKey && !commandModifier(ev)) {
+      const selected = this.store.get().selection;
+      const line = selected.size === 1 && selected.has(hit.id) ? this.codeGutterLine(hit.id, ev) : null;
+      if (line !== null) {
+        this.store.selectCodeLines(hit.id, line, ev.shiftKey);
+        // Two quick gutter clicks are two picks, never a way into the code.
+        this.lastContentClick = null;
+        return;
+      }
+      if (!ev.shiftKey) this.store.clearCodeLines();
+    }
     if (hit) {
       const selection = this.store.get().selection;
       this.pendingTextEdit = !ev.shiftKey
@@ -2953,9 +3196,11 @@ export class EditorCanvas {
         ? { elementId: hit.id, clientX: ev.clientX, clientY: ev.clientY, selectWord: secondClick }
         : null;
       this.pendingMediaToggle = secondClick && !ev.shiftKey
-        && (hit.type === 'video' || hit.type === 'web' || hit.type === 'image')
+        && (hit.type === 'video' || hit.type === 'web' || hit.type === 'image' || hit.type === 'code')
         ? hit.id
         : null;
+      this.pendingCodePoint = hit.type === 'code' ? { clientX: ev.clientX, clientY: ev.clientY } : null;
+      this.pendingPathEdit = secondClick && !ev.shiftKey && isLineFamily(hit) ? hit.id : null;
       if (!selection.has(hit.id)) {
         this.store.select([hit.id], ev.shiftKey);
       } else if (ev.shiftKey) {
@@ -2981,6 +3226,24 @@ export class EditorCanvas {
     // Presence: report the pointer in slide space whether hovering or
     // dragging, so collaborators see the cursor move, not only the edits.
     this.onPointerSample?.(this.toCanvas(ev));
+    if (this.pen) {
+      // Hovering moves the preview; with the button down, the press pulls
+      // out the new point's handles.
+      this.pen.move(wholePixel(this.toCanvas(ev)), ev.shiftKey, DRAG_THRESHOLD_PX / this.scale);
+      this.redrawOverlay();
+      return;
+    }
+    if (this.pencil) {
+      const stroke = this.pencil.stroke;
+      if (stroke && !isHoverMove(ev)) {
+        // Every sample the pointer reported since the last frame, so a quick
+        // stroke keeps its shape.
+        const samples = ev.getCoalescedEvents?.() ?? [];
+        for (const sample of samples.length > 0 ? samples : [ev]) stroke.push(this.toCanvas(sample));
+        this.redrawOverlay();
+      }
+      return;
+    }
     if (this.drag.kind === 'none') return;
     // Only a held button drags. See `isHoverMove`.
     if (isHoverMove(ev)) return;
@@ -3314,6 +3577,12 @@ export class EditorCanvas {
             const control = resizePointByScale(origin.control, origin, resized, scaleX, scaleY);
             el.control = { x: Math.round(control.x), y: Math.round(control.y) };
           }
+          // A drawn path is redrawn at the new size rather than stretched by
+          // its viewBox, which would stretch its stroke too: a line drawn
+          // with the pen keeps its width however its box is pulled.
+          if (el.type === 'shape' && origin.path) {
+            redrawPathAtSize(el, origin.path, origin);
+          }
         });
         for (const id of drag.origins.keys()) this.syncTableHeight(id);
         break;
@@ -3426,6 +3695,24 @@ export class EditorCanvas {
         break;
       }
 
+      case 'path-point': {
+        const drag = this.drag;
+        this.store.updateSelected((target) => {
+          if (target.id === drag.elementId && target.type === 'shape') {
+            this.dragPathPoint(target, drag, point, ev);
+          }
+        });
+        break;
+      }
+
+      case 'path-bend': {
+        const drag = this.drag;
+        this.store.updateSelected((target) => {
+          if (target.id === drag.elementId && target.type === 'shape') bendPath(target, drag, point);
+        });
+        break;
+      }
+
       case 'marquee': {
         const s = this.drag.startCanvas;
         this.marquee = {
@@ -3450,14 +3737,30 @@ export class EditorCanvas {
     if (
       this.drag.kind === 'none'
       && (ev.target as HTMLElement | null)?.closest?.(
-        '.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .canvas-ruler',
+        `.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer, .objects-toggle, .objects-drawer, .light-table, .canvas-ruler, .${CODE_EDIT_CHROME}`,
       )
     ) {
+      return;
+    }
+    if (this.pen) {
+      this.host.releasePointerCapture?.(ev.pointerId);
+      if (this.pen.up()) this.finishPen(true);
+      else this.redrawOverlay();
+      return;
+    }
+    if (this.pencil) {
+      this.host.releasePointerCapture?.(ev.pointerId);
+      const stroke = this.pencil.stroke;
+      this.pencil.stroke = null;
+      if (stroke) this.finishPencilStroke(stroke);
+      this.redrawOverlay();
       return;
     }
     const textEdit = !this.dragStarted ? this.pendingTextEdit : null;
     const mediaToggle = !this.dragStarted ? this.pendingMediaToggle : null;
     this.pendingMediaToggle = null;
+    const pathEdit = !this.dragStarted ? this.pendingPathEdit : null;
+    this.pendingPathEdit = null;
     if (this.drag.kind === 'marquee' && this.marquee) {
       const slide = this.store.slide;
       if (slide) {
@@ -3476,6 +3779,7 @@ export class EditorCanvas {
       this.mediaToggledAt = ev.timeStamp;
       this.toggleMedia(mediaToggle);
     }
+    if (pathEdit && this.pathEdit?.elementId !== pathEdit) this.beginPathEdit(pathEdit);
   }
 
   /**
@@ -3505,6 +3809,22 @@ export class EditorCanvas {
     if (el?.type === 'video') this.toggleVideo(elementId);
     else if (el?.type === 'web') this.toggleWebLive(elementId);
     else if (el?.type === 'image') this.toggleMaskMode(elementId);
+    else if (el?.type === 'code' && this.pendingCodePoint) this.codeEditor.begin(elementId, this.pendingCodePoint);
+  }
+
+  /** Start typing into a code block on the slide; `'all'` selects its code to be typed over. */
+  beginCodeEdit(elementId: string, at?: { clientX: number; clientY: number } | 'all'): boolean {
+    return this.codeEditor.begin(elementId, at);
+  }
+
+  /** The code block being typed into, or null. */
+  editingCodeId(): string | null {
+    return this.codeEditor.editingId();
+  }
+
+  /** End a code edit, committing it. */
+  endCodeEdit(): void {
+    this.codeEditor.end(true);
   }
 
   private endDrag(): void {
@@ -3519,6 +3839,7 @@ export class EditorCanvas {
     this.marquee = null;
     this.pendingTextEdit = null;
     this.pendingMediaToggle = null;
+    this.pendingPathEdit = null;
 
     // Deliberately *not* a full render. Redrawing the slide layer here would
     // replace the node the pointer went down on, and a browser cannot
@@ -3624,6 +3945,9 @@ export class EditorCanvas {
     // Two quick presses on the comparison chip are two choices, not a way
     // into whatever lies under it.
     if ((ev.target as HTMLElement).closest(`.${COMPARE_CHIP_CLASS}`)) return;
+    // The pen reads its own double-click, from the presses (penPointerDown);
+    // with the pencil out, presses only draw.
+    if (this.pen || this.pencil || ev.timeStamp - this.penFinishedAt <= DOUBLE_CLICK_MS) return;
     // Once editing is active, native browser double-click selection owns this
     // gesture. Calling beginTextEdit again would select the entire text box and
     // replace the word selection the browser just made. Under heavy renderer
@@ -3671,7 +3995,10 @@ export class EditorCanvas {
     const hit = this.hitTest(this.toCanvas(ev as PointerEvent));
     if (!hit) return;
 
-    if (hit.type === 'text' || hit.type === 'html') {
+    // Any line — straight, curved, an arrow, a path — opens its points, as in Figma.
+    if (isLineFamily(hit)) {
+      if (this.pathEdit?.elementId !== hit.id && editableRuns(hit)) this.beginPathEdit(hit.id);
+    } else if (hit.type === 'text' || hit.type === 'html') {
       this.beginTextEdit(hit.id);
     } else if (hit.type === 'shape' && canHoldText(hit)) {
       // Typing into a rectangle or an ellipse makes it a text box with the
@@ -3691,7 +4018,425 @@ export class EditorCanvas {
       // toggled on its second pointer-up; toggling again would undo it.
       if (ev.timeStamp - this.mediaToggledAt <= DOUBLE_CLICK_MS) return;
       this.toggleMedia(hit.id);
+    } else if (hit.type === 'code') {
+      // Code is typed into on the slide; the second press of the pair may
+      // already have opened it (see pendingMediaToggle).
+      if (this.codeEditor.editingId() === hit.id) return;
+      this.codeEditor.begin(hit.id, { clientX: ev.clientX, clientY: ev.clientY });
     }
+  }
+
+  /** Start drawing a path with the pen (Pen ▾ → Pen, or P). */
+  startPen(): void {
+    const slide = this.store.slide;
+    if (!slide) return;
+    this.endDrawingModes();
+    this.pen = new PenDraft(slide.id);
+    pathKeysOwner = this;
+    this.host.classList.add('pen-tool');
+    this.onPenToolChange?.('pen');
+    this.store.clearSelection();
+    this.redrawOverlay();
+    this.notice('Click to add points, drag to curve. Click the first point to close the shape; Return to finish a line.');
+  }
+
+  /** Start drawing freehand with the pencil (Pen ▾ → Pencil, or Shift+P). */
+  startPencil(): void {
+    const slide = this.store.slide;
+    if (!slide) return;
+    this.endDrawingModes();
+    this.pencil = { slideId: slide.id, stroke: null };
+    pathKeysOwner = this;
+    this.host.classList.add('pencil-tool');
+    this.onPenToolChange?.('pencil');
+    this.store.clearSelection();
+    this.redrawOverlay();
+    this.notice('Drag to draw; each stroke becomes a smooth line. Escape or Return when done.');
+  }
+
+  /** What the pen and pencil leave behind when another mode, or the other of the two, starts. */
+  private endDrawingModes(): void {
+    if (this.editingId) this.endTextEditing(true);
+    if (this.maskingId) this.toggleMaskMode(null);
+    this.endWebLive();
+    this.endPathEdit();
+    this.endPen();
+    this.endPencil();
+  }
+
+  /** The Pen button: take the pen up, or put it down, finishing a line. */
+  togglePen(): void {
+    if (this.pen) this.finishPen(false);
+    else this.startPen();
+  }
+
+  /** The Pencil: take it up, or put it down. */
+  togglePencil(): void {
+    if (this.pencil) this.endPencil();
+    else this.startPencil();
+  }
+
+  /** Which drawing tool is out, if either. */
+  drawingTool(): DrawingTool | null {
+    return this.pen ? 'pen' : this.pencil ? 'pencil' : null;
+  }
+
+  /** Whether the pen is drawing. */
+  isDrawingPath(): boolean {
+    return this.pen !== null;
+  }
+
+  /** Put the pen down without adding anything. */
+  private endPen(): void {
+    if (!this.pen) return;
+    this.pen = null;
+    this.host.classList.remove('pen-tool');
+    this.onPenToolChange?.(null);
+    this.redrawOverlay();
+    // Take the pen's instructions out of the status bar.
+    this.notice('');
+  }
+
+  /** Put the pencil down; a stroke still under the pointer is dropped. */
+  private endPencil(): void {
+    if (!this.pencil) return;
+    this.pencil = null;
+    this.host.classList.remove('pencil-tool');
+    this.onPenToolChange?.(null);
+    this.redrawOverlay();
+    this.notice('');
+  }
+
+  /**
+   * A pencil stroke is done: its samples, smoothed, become a path on the
+   * slide it was drawn on. The pencil stays out and nothing is selected, so
+   * the next stroke can follow straight on.
+   */
+  private finishPencilStroke(samples: XY[]): void {
+    const pencil = this.pencil;
+    if (!pencil) return;
+    const run = freehandRun(samples, PENCIL_TOLERANCE_SCREEN_PX / this.scale);
+    const index = this.store.get().deck.slides.findIndex((slide) => slide.id === pencil.slideId);
+    if (!run || index < 0) return;
+    insertPath(this.store, index, run, { select: false, label: 'Draw with Pencil' });
+  }
+
+  /**
+   * Finish the drawing: closed, a filled shape; open, a line. Fewer than two
+   * points draw nothing, and the pen is simply put down.
+   */
+  private finishPen(closed: boolean): void {
+    const pen = this.pen;
+    if (!pen) return;
+    this.endPen();
+    const run = pen.result(closed);
+    const index = this.store.get().deck.slides.findIndex((slide) => slide.id === pen.slideId);
+    if (!run || index < 0) return;
+    insertPath(this.store, index, run);
+  }
+
+  private penPointerDown(ev: PointerEvent, point: XY, secondClick: boolean): void {
+    const pen = this.pen!;
+    const tolerance = PEN_POINT_SCREEN_PX / this.scale;
+    // The second press of a double-click on the point the first one placed
+    // finishes the line there.
+    if (secondClick && pen.onLast(point, tolerance)) {
+      if (pen.nodes.length < 2) return;
+      this.penFinishedAt = ev.timeStamp;
+      this.finishPen(false);
+      return;
+    }
+    pen.down(wholePixel(point), ev.shiftKey, tolerance);
+    this.redrawOverlay();
+  }
+
+  private onPathKey(ev: KeyboardEvent): void {
+    if ((!this.pen && !this.pathEdit && !this.pencil) || pathKeysOwner !== this) return;
+    const t = ev.target instanceof HTMLElement ? ev.target : null;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (this.pencil) {
+      // Undo and everything else stay the deck's: each stroke is already in it.
+      if (ev.key !== 'Escape' && ev.key !== 'Enter') return;
+      this.endPencil();
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      return;
+    }
+    if (!this.pen) {
+      this.onPathEditKey(ev);
+      return;
+    }
+    const undo = (ev.metaKey || ev.ctrlKey) && !ev.shiftKey && ev.key.toLowerCase() === 'z';
+    if (ev.key === 'Enter' || ev.key === 'Escape') {
+      this.finishPen(false);
+    } else if ((ev.key === 'Backspace' || ev.key === 'Delete' || undo) && this.pen.nodes.length > 0) {
+      this.pen.removeLast();
+      this.redrawOverlay();
+    } else {
+      // With nothing drawn yet, undo is the deck's again.
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  }
+
+  /** The path whose points are being edited, if any. */
+  pathEditingElement(): string | null {
+    return this.pathEdit?.elementId ?? null;
+  }
+
+  /** Start or stop editing a path's points (Edit points; null stops). */
+  togglePathEdit(elementId: string | null): void {
+    if (elementId === null || this.pathEdit?.elementId === elementId) this.endPathEdit();
+    else this.beginPathEdit(elementId);
+  }
+
+  private beginPathEdit(elementId: string): void {
+    const el = this.store.slide?.elements.find((candidate) => candidate.id === elementId);
+    if (!el || !editableRuns(el)) return;
+    if (this.editingId) this.endTextEditing(true);
+    if (this.maskingId) this.toggleMaskMode(null);
+    this.endPen();
+    this.endPencil();
+    this.pathEdit = { elementId, point: null };
+    pathKeysOwner = this;
+    const selected = this.store.get().selection;
+    if (selected.size !== 1 || !selected.has(elementId)) this.store.select([elementId]);
+    this.onPathEditChange?.(elementId);
+    this.redrawOverlay();
+    this.notice('Drag points and handles; click the outline to add a point, Cmd/Ctrl-drag it to bend. Option-drag a handle to break it, Delete removes a point, Escape when done.');
+  }
+
+  private endPathEdit(): void {
+    if (!this.pathEdit) return;
+    this.pathEdit = null;
+    this.onPathEditChange?.(null);
+    this.redrawOverlay();
+    this.notice('');
+  }
+
+  /**
+   * The edited path's points over the slide: every anchor, and the handles
+   * that shape the curves on either side of the selected one.
+   */
+  private pathEditOverlay(elementId: string, paths: SubPath[], deck: Deck): DocumentFragment {
+    const selected = this.pathEdit?.point ?? null;
+    const knobs: OverlayKnob[] = [];
+    if (selected) {
+      const run = paths[selected.sub];
+      const count = run.nodes.length;
+      const neighbours = [
+        { index: selected.index, sides: ['in', 'out'] as const },
+        ...(selected.index > 0 || run.closed
+          ? [{ index: (selected.index - 1 + count) % count, sides: ['out'] as const }] : []),
+        ...(selected.index < count - 1 || run.closed
+          ? [{ index: (selected.index + 1) % count, sides: ['in'] as const }] : []),
+      ];
+      for (const { index, sides } of neighbours) {
+        const node = run.nodes[index];
+        for (const side of sides) {
+          const at = node[side];
+          if (at) knobs.push({ at, from: node, key: `${selected.sub}:${index}:${side}` });
+        }
+      }
+    }
+    return pathOverlay({
+      outline: serializePath(paths),
+      anchors: paths.flatMap((run, sub) => run.nodes.map((node, index) => ({
+        at: node,
+        key: `${sub}:${index}`,
+        selected: selected?.sub === sub && selected.index === index,
+      }))),
+      knobs,
+      elementId,
+      scale: this.scale,
+      canvas: deck.canvas,
+    });
+  }
+
+  /**
+   * A press while a path's points are being edited. On a point or a handle it
+   * starts dragging that; on the outline it adds a point there and drags the
+   * new point. Elsewhere on the path it only clears the point selection, and
+   * anywhere else it ends point editing; either way the press then goes on as
+   * an ordinary one (returns false).
+   */
+  private pathEditPointerDown(ev: PointerEvent, target: HTMLElement, point: XY, secondClick: boolean): boolean {
+    const edit = this.pathEdit!;
+    const el = this.store.slide?.elements.find((candidate) => candidate.id === edit.elementId);
+    const paths = el ? editableRuns(el) : null;
+    if (el?.type !== 'shape' || !paths) {
+      this.endPathEdit();
+      return false;
+    }
+    const begin = (label: string, sub: number, index: number, which: 'anchor' | 'in' | 'out', origin: ShapeEl) => {
+      edit.point = { sub, index };
+      this.drag = { kind: 'path-point', elementId: el.id, sub, index, which, startCanvas: point, origin };
+      this.store.beginTransaction(label);
+      this.redrawOverlay();
+    };
+    const handleKey = target.dataset?.pathHandle;
+    if (handleKey && target.dataset.elementId === el.id) {
+      const [sub, index, which] = handleKey.split(':');
+      // A neighbour's handle may be the one grabbed; the selected point, whose
+      // handles are on show, stays the selected one.
+      const selected = edit.point;
+      begin('Move handle', Number(sub), Number(index), which as 'in' | 'out', el);
+      edit.point = selected;
+      return true;
+    }
+    const pointKey = target.dataset?.pathNode;
+    if (pointKey && target.dataset.elementId === el.id) {
+      // A double-click on a point turns a corner smooth or a smooth point
+      // sharp. Read from the presses: the overlay is redrawn under the
+      // pointer by the first one, so no dblclick names the point.
+      if (secondClick) {
+        this.togglePathPointSmooth(pointKey);
+        return true;
+      }
+      const [sub, index] = pointKey.split(':').map(Number);
+      begin('Move point', sub, index, 'anchor', el);
+      return true;
+    }
+    const hit = nearestOnPath(paths, point);
+    if (hit && hit.distance <= LINE_HIT_SCREEN_PX / this.scale && commandModifier(ev)) {
+      // Cmd/Ctrl on the outline is Figma's bend: the line curves to follow
+      // the pointer, a straight line becoming a curve and staying a line.
+      edit.point = null;
+      this.store.beginTransaction('Bend');
+      this.drag = {
+        kind: 'path-bend', elementId: el.id, sub: hit.sub, segment: hit.segment, t: hit.t,
+        through: hit.point, startCanvas: point, origin: el,
+      };
+      this.redrawOverlay();
+      return true;
+    }
+    if (hit && hit.distance <= LINE_HIT_SCREEN_PX / this.scale) {
+      // One undo step: the new point and wherever this press drags it. A
+      // line given a third point becomes a path.
+      this.store.beginTransaction('Add point');
+      let added = -1;
+      this.store.updateSelected((shape) => {
+        if (shape.id !== el.id || shape.type !== 'shape') return;
+        const next = editableRuns(shape)!;
+        added = insertNode(next, hit.sub, hit.segment, hit.t);
+        setEditableRuns(shape, next);
+      });
+      const inserted = this.store.slide?.elements.find((candidate) => candidate.id === el.id);
+      if (inserted?.type === 'shape' && added >= 0) begin('Add point', hit.sub, added, 'anchor', inserted);
+      return true;
+    }
+    edit.point = null;
+    if (this.hitTest(point)?.id !== el.id) this.endPathEdit();
+    else this.redrawOverlay();
+    return false;
+  }
+
+  /**
+   * One frame of a point or handle drag, always from the shape as the drag
+   * found it. Shift keeps a point on a 45° line from where it started, or a
+   * handle at a 45° angle; Option/Alt moves a handle alone.
+   */
+  private dragPathPoint(
+    target: ShapeEl,
+    drag: Extract<DragMode, { kind: 'path-point' }>,
+    point: XY,
+    ev: PointerEvent,
+  ): void {
+    const { origin } = drag;
+    restoreShape(target, origin);
+    const dx = point.x - drag.startCanvas.x;
+    const dy = point.y - drag.startCanvas.y;
+    // A line stays a line: its ends move with its curve's control point left
+    // where it was, and either handle moves that control point, the other
+    // following. Only a handle broken free (Option) takes it past what a
+    // line can be, into a path.
+    if (isTwoPointLine(origin) && (drag.which === 'anchor' || !ev.altKey)) {
+      const { start, end } = lineEndpoints(origin);
+      const ends = [start, end];
+      const node = ends[drag.index];
+      if (!node) return;
+      if (drag.which === 'anchor') {
+        const moved = wholePixel({ x: node.x + dx, y: node.y + dy });
+        ends[drag.index] = ev.shiftKey ? constrainAngle(node, moved) : moved;
+        Object.assign(target, lineFromEndpoints(ends[0], ends[1], origin.h));
+        target.control = origin.control ? { ...origin.control } : null;
+        return;
+      }
+      const handle = lineRun(start, end, origin.control).nodes[drag.index][drag.which];
+      if (!handle) return;
+      const moved = wholePixel({ x: handle.x + dx, y: handle.y + dy });
+      const control = controlFromHandle(node, ev.shiftKey ? constrainAngle(node, moved) : moved);
+      target.control = { x: Math.round(control.x), y: Math.round(control.y) };
+      return;
+    }
+    const paths = editableRuns(target);
+    const node = paths?.[drag.sub]?.nodes[drag.index];
+    if (!paths || !node) return;
+    if (drag.which === 'anchor') {
+      const moved = wholePixel({ x: node.x + dx, y: node.y + dy });
+      moveNode(node, ev.shiftKey ? constrainAngle(node, moved) : moved);
+    } else {
+      const handle = node[drag.which];
+      if (!handle) return;
+      const moved = wholePixel({ x: handle.x + dx, y: handle.y + dy });
+      moveHandle(node, drag.which, ev.shiftKey ? constrainAngle(node, moved) : moved, ev.altKey);
+    }
+    setEditableRuns(target, paths);
+  }
+
+  /** A double-click on a point: a corner becomes smooth, a smooth point a corner. */
+  private togglePathPointSmooth(key: string): void {
+    const edit = this.pathEdit;
+    if (!edit) return;
+    const [sub, index] = key.split(':').map(Number);
+    edit.point = { sub, index };
+    this.store.updateSelected((shape) => {
+      if (shape.id !== edit.elementId || shape.type !== 'shape') return;
+      const paths = editableRuns(shape);
+      if (!paths?.[sub]?.nodes[index]) return;
+      toggleSmooth(paths[sub], index);
+      setEditableRuns(shape, paths);
+    }, { label: 'Smooth or sharpen point' });
+    this.redrawOverlay();
+  }
+
+  private onPathEditKey(ev: KeyboardEvent): void {
+    const edit = this.pathEdit!;
+    if (ev.key === 'Escape' || ev.key === 'Enter') {
+      this.endPathEdit();
+    } else if (ev.key === 'Backspace' || ev.key === 'Delete') {
+      const point = edit.point;
+      if (point) this.deletePathPoint(edit.elementId, point);
+    } else {
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  }
+
+  /** Remove a point; removing the last one that leaves a line removes the shape. */
+  private deletePathPoint(elementId: string, point: { sub: number; index: number }): void {
+    const el = this.store.slide?.elements.find((candidate) => candidate.id === elementId);
+    const paths = el ? editableRuns(el) : null;
+    if (!paths) return;
+    const remaining = removeNode(paths, point.sub, point.index);
+    this.pathEdit!.point = null;
+    if (remaining.length === 0) {
+      this.store.deleteSelection();
+      return;
+    }
+    this.store.updateSelected((shape) => {
+      if (shape.id === elementId && shape.type === 'shape') setEditableRuns(shape, remaining);
+    }, { label: 'Delete point' });
+    this.redrawOverlay();
+  }
+
+  /** Redraw just the chrome over the slide, for state the deck does not hold. */
+  private redrawOverlay(): void {
+    const { deck, slideIndex, selection } = this.store.get();
+    const slide = deck.slides[slideIndex];
+    if (slide) this.drawOverlay(deck, slide.elements, selection);
   }
 
   /** Whether this web element's page is currently running on the canvas. */
@@ -7362,6 +8107,59 @@ export class EditorCanvas {
   }
 
   /** Topmost element containing a canvas point. */
+  /**
+   * Where lines `from`…`to` of a drawn code block sit, in slide units: from
+   * the DOM when the block is on the canvas, else from its typography.
+   */
+  private codeLineBox(
+    el: SlideElement, from: number, to: number, stageRect: DOMRect,
+  ): { top: number; height: number } | null {
+    if (el.type !== 'code') return null;
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(el.id)}"] > .code-body`,
+    );
+    const first = body?.querySelector<HTMLElement>(`:scope > .code-line[data-line="${from}"]`);
+    const last = body?.querySelector<HTMLElement>(`:scope > .code-line[data-line="${to}"]`);
+    if (first && last && !el.rot) {
+      const a = first.getBoundingClientRect();
+      const b = last.getBoundingClientRect();
+      if (a.height > 0) {
+        const top = (a.top - stageRect.top) / this.scale;
+        return { top, height: (b.bottom - a.top) / this.scale };
+      }
+    }
+    const lineHeight = el.fontSize * CODE_LINE_HEIGHT;
+    return {
+      top: el.y + el.fontSize * CODE_PADDING_EM[0] + (from - 1) * lineHeight,
+      height: (to - from + 1) * lineHeight,
+    };
+  }
+
+  /**
+   * The line whose gutter a press landed in, on a drawn code block: the line
+   * numbers, or the margin left of the code when it has none. Null for a
+   * press on the code itself.
+   */
+  private codeGutterLine(elementId: string, ev: PointerEvent): number | null {
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(elementId)}"] > .code-body`,
+    );
+    if (!body) return null;
+    const bodyRect = body.getBoundingClientRect();
+    if (ev.clientX < bodyRect.left) return null;
+    for (const line of body.querySelectorAll<HTMLElement>(':scope > .code-line')) {
+      const rect = line.getBoundingClientRect();
+      if (ev.clientY < rect.top || ev.clientY >= rect.bottom) continue;
+      const gutter = line.querySelector<HTMLElement>('.code-gutter');
+      const right = gutter
+        ? gutter.getBoundingClientRect().right
+          + (Number.parseFloat(getComputedStyle(gutter).marginRight) || 0) * this.scale * 0.5
+        : rect.left;
+      return ev.clientX <= right ? Number(line.dataset.line) : null;
+    }
+    return null;
+  }
+
   private hitTest(point: { x: number; y: number }): SlideElement | null {
     const slide = this.store.slide;
     if (!slide) return null;
@@ -7744,12 +8542,15 @@ function sameStructure(a: Slide, b: Slide, ignoreHtml = false): boolean {
       JSON.stringify(x.effects ?? []) !== JSON.stringify(y.effects ?? [])
     ) return false;
     // Shape paint and kind live on SVG children; wrapper-only updates cannot
-    // apply them. Rebuild when they change (including rect -> ellipse).
+    // apply them. Rebuild when they change (including rect -> ellipse). The
+    // path itself is geometry: the patch redraws the SVG (`syncShapeBody`),
+    // so dragging a point does not rebuild the slide on every frame.
     if (x.type === 'shape' && y.type === 'shape') {
       if (
         x.shape !== y.shape || x.fill !== y.fill || x.stroke !== y.stroke ||
         x.strokeWidth !== y.strokeWidth || x.radius !== y.radius ||
-        x.path !== y.path || x.arrowStart !== y.arrowStart || x.arrowEnd !== y.arrowEnd ||
+        x.arrowStart !== y.arrowStart || x.arrowEnd !== y.arrowEnd || x.strokeStyle !== y.strokeStyle ||
+        x.strokeDash !== y.strokeDash || x.startCap !== y.startCap || x.endCap !== y.endCap ||
         Boolean(x.control) !== Boolean(y.control)
       ) return false;
     }
@@ -7762,6 +8563,11 @@ function sameStructure(a: Slide, b: Slide, ignoreHtml = false): boolean {
     if (ac !== bc) return false;
   }
   return true;
+}
+
+/** A point on the canvas's own pixel grid, where the pen and point drags put points. */
+function wholePixel(point: XY): XY {
+  return { x: Math.round(point.x), y: Math.round(point.y) };
 }
 
 /** Axis-aligned bounds of an element as rendered (rotation about its centre). */
@@ -7870,6 +8676,17 @@ export function elementContainsPoint(
     const nearestY = start.y + t * vy;
     return Math.hypot(point.x - nearestX, point.y - nearestY) <=
       Math.max(tolerance, el.strokeWidth / 2);
+  }
+  // An unfilled path — a line drawn with the pen, outline art — is hit along
+  // its stroke, as a line is; its box is mostly empty slide.
+  if (el.type === 'shape' && el.shape === 'path' && !visiblePaint(el.fill)) {
+    const paths = pathOnCanvas(el);
+    if (paths) {
+      const size = el.pathSize ?? { w: el.w, h: el.h };
+      const width = el.strokeWidth * Math.sqrt((el.w / size.w) * (el.h / size.h));
+      const hit = nearestOnPath(paths, point);
+      return hit !== null && hit.distance <= Math.max(tolerance, width / 2);
+    }
   }
   // Rotated elements render about their centre; undo the rotation on the
   // point so the axis-aligned bounds check matches what's on screen.
@@ -8059,28 +8876,7 @@ export function hasEndpoints(el: SlideElement): boolean {
   return el.type === 'shape' && (el.shape === 'line' || el.shape === 'arrow' || el.shape === 'brace');
 }
 
-/**
- * The two endpoints of a line/arrow/brace element in canvas coordinates. The shape
- * renders from the box's left-centre to right-centre, rotated about the
- * box centre — so endpoints are derived, not stored.
- */
-export function lineEndpoints(el: {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  rot: number;
-}): { start: { x: number; y: number }; end: { x: number; y: number } } {
-  const cx = el.x + el.w / 2;
-  const cy = el.y + el.h / 2;
-  const rad = (el.rot * Math.PI) / 180;
-  const dx = (Math.cos(rad) * el.w) / 2;
-  const dy = (Math.sin(rad) * el.w) / 2;
-  return {
-    start: { x: cx - dx, y: cy - dy },
-    end: { x: cx + dx, y: cy + dy },
-  };
-}
+export { lineEndpoints, lineFromEndpoints } from '@shared/lineFamily.js';
 
 /**
  * Project `point` onto the nearest ray from `anchor` whose angle is a multiple
@@ -8102,19 +8898,6 @@ export function snapToAngleStep(
   const uy = Math.sin(angle);
   const length = dx * ux + dy * uy;
   return { x: anchor.x + ux * length, y: anchor.y + uy * length };
-}
-
-/** Rebuild a line element's box+rotation from two endpoints. */
-export function lineFromEndpoints(
-  start: { x: number; y: number },
-  end: { x: number; y: number },
-  h: number,
-): { x: number; y: number; w: number; h: number; rot: number } {
-  const w = Math.max(8, Math.hypot(end.x - start.x, end.y - start.y));
-  const rot = (Math.atan2(end.y - start.y, end.x - start.x) * 180) / Math.PI;
-  const cx = (start.x + end.x) / 2;
-  const cy = (start.y + end.y) / 2;
-  return { x: cx - w / 2, y: cy - h / 2, w, h, rot };
 }
 
 function unionRect(rects: Rect[]): Rect {
@@ -8275,4 +9058,37 @@ function resizePointByScale(
     x: resized.x + resized.w / 2 + localX * cos - localY * sin,
     y: resized.y + resized.h / 2 + localX * sin + localY * cos,
   };
+}
+
+/** The geometry a point drag or a bend starts from, put back before each frame of it. */
+const RESTORED_SHAPE_KEYS = [
+  'x', 'y', 'w', 'h', 'rot', 'shape', 'path', 'pathSize', 'control', 'arrowStart', 'arrowEnd', 'flipX', 'flipY',
+] as const;
+
+function restoreShape(target: ShapeEl, origin: ShapeEl): void {
+  const into = target as unknown as Record<string, unknown>;
+  const from = origin as unknown as Record<string, unknown>;
+  for (const key of RESTORED_SHAPE_KEYS) {
+    if (from[key] === undefined) delete into[key];
+    else into[key] = structuredClone(from[key]);
+  }
+}
+
+/**
+ * One frame of a bend, from the shape as the drag found it. A two-point line
+ * takes the quadratic through the pointer, and stays a line; a path bends the
+ * one segment.
+ */
+function bendPath(target: ShapeEl, drag: Extract<DragMode, { kind: 'path-bend' }>, point: XY): void {
+  restoreShape(target, drag.origin);
+  const delta = { x: point.x - drag.startCanvas.x, y: point.y - drag.startCanvas.y };
+  if (isTwoPointLine(target)) {
+    bendLine(target, drag.t, { x: drag.through.x + delta.x, y: drag.through.y + delta.y });
+    return;
+  }
+  const runs = editableRuns(target);
+  const run = runs?.[drag.sub];
+  if (!runs || !run) return;
+  bendSegment(run, drag.segment, drag.t, delta);
+  setEditableRuns(target, runs);
 }

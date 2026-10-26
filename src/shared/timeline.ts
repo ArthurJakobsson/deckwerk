@@ -11,6 +11,14 @@ import {
   termBuildLabels,
   type TermState,
 } from './equationTerms.js';
+import {
+  applyLineAction,
+  formatLineRanges,
+  initialCodeLineStates,
+  isLineBuild,
+  lineBuildSteps,
+  type CodeLineState,
+} from './codeBlocks.js';
 
 /**
  * Timeline reasoning, shared by the player and the editor's timeline panel.
@@ -125,6 +133,25 @@ export function drawDuration(entry: TimelineEntry): number {
 export function expandTimeline(slide: Slide): ExpandedEntry[] {
   const out: ExpandedEntry[] = [];
   for (const entry of slide.timeline) {
+    // A code block built line by line fans out the same way, one unit per
+    // line, each naming its lines so it can be run on its own
+    // (shared/codeBlocks.ts). A build that names its lines is one unit.
+    if (isLineBuild(entry, slide) && !entry.action.lines) {
+      const steps = lineBuildSteps(entry, slide);
+      if (steps.length > 0) {
+        steps.forEach((lines, index) => out.push({
+          id: index === 0 ? entry.id : `${entry.id}#l${index}`,
+          sourceId: entry.id,
+          part: null,
+          partCount: 1,
+          trigger: index === 0
+            ? entry.trigger
+            : { on: entry.trigger.on === 'click' ? 'click' : 'afterPrev', ref: null, delay: entry.trigger.delay },
+          action: { ...entry.action, lines: formatLineRanges(lines) },
+        }));
+        continue;
+      }
+    }
     // An equation's terms fan out the same way, one unit per term label, each
     // naming its term so it can be run on its own.
     if (isTermBuild(entry) && !entry.action.term) {
@@ -217,6 +244,11 @@ export interface SlideState {
   parts: Map<string, number>;
   /** For equations with term builds: which terms are still hidden, and term colours. */
   terms: Map<string, TermState>;
+  /**
+   * For code blocks with line builds: which lines are still hidden, and the
+   * highlight or dim that holds. A block with none shows every line plainly.
+   */
+  lines: Map<string, CodeLineState>;
 }
 
 /**
@@ -249,6 +281,7 @@ export function resolveState(slide: Slide, step: number): SlideState {
         .map((entry) => [entry.action.target, 0]),
     ),
     terms: initialTermStates(slide),
+    lines: initialCodeLineStates(slide),
   };
 
   const steps = groupIntoSteps(slide);
@@ -307,6 +340,9 @@ export function applyAction(
     case 'pulse':
     case 'jiggle':
     case 'pop':
+      break;
+    case 'lines':
+      applyLineAction(state.lines, entry, slide);
       break;
   }
 }

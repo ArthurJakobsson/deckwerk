@@ -4,6 +4,7 @@ import '../editor/editor.css';
 import './collab.css';
 import '../lightTheme.css';
 import { applyUiTheme } from '../uiTheme.js';
+import { applyUiScale } from '../uiScale.js';
 import { emptyDeck } from '@shared/deck.js';
 import { setIdSuffix } from '@shared/geometry.js';
 import { CANVAS_NOTICE_EVENT, EditorCanvas } from '../editor/canvas.js';
@@ -20,16 +21,21 @@ import {
 } from '../editor/exportPicker.js';
 import { showPdfExportDialog } from '../editor/pdfExportDialog.js';
 import { HistoryPanel } from '../editor/historyPanel.js';
+import { LightTable } from '../editor/lightTable.js';
+import { MediaPanel, installMediaDrop } from '../editor/mediaPanel.js';
+import { createHistoryButton, createMediaButton, popoverPanelHost } from '../editor/toolbarPanels.js';
+import { ObjectList } from '../editor/objectList.js';
 import {
+  createPenButton,
   createShapeInsertPicker,
   createTableInsertPicker,
   insertText,
 } from '../editor/elementCreation.js';
+import { insertCode } from '../editor/codeInspector.js';
 import { Inspector } from '../editor/inspector.js';
 import {
   barButton,
-  barIconButton,
-  TEXT_ICON,
+  createTextInsertPicker,
   bindEditorKeys,
   createClipboardActions,
   makeContextActions,
@@ -70,6 +76,7 @@ import { setSlideColorSource } from '../editor/colorPicker.js';
 import { slideColors } from '@shared/slideColors.js';
 
 applyUiTheme();
+applyUiScale();
 
 /**
  * Browser collaboration shell: the same canvas, rail, inspector, theme
@@ -270,11 +277,27 @@ new SpeakerNotesDrawer(el('canvas'), store, {
 // The toggle only: Cmd/Ctrl+R, the desktop app's shortcut, is the browser's
 // reload here, and a page that swallowed it would surprise more than help.
 new CanvasRulers(el('canvas'), canvas, store);
+new LightTable(el('canvas'), canvas, store);
 const inspector = new Inspector(el('inspector'), store);
 new TimelinePanel(el('timeline'), store, new BuildPreview(canvas, store));
-new HistoryPanel(el('history'), store);
+// History opens beside the deck name and Media from the Insert bar, as in the
+// desktop app (toolbarPanels.ts).
+const historyHost = popoverPanelHost('history');
+new HistoryPanel(historyHost, store);
+const mediaHost = popoverPanelHost('media');
+const mediaPanel = new MediaPanel(mediaHost, store, {
+  setStatusMessage,
+  beginOperation: (message) => operationProgress.begin(message),
+});
+installMediaDrop(el('canvas'), store, mediaPanel);
 const rail = new SlideRail(el('rail'), store);
 rail.onStatus = setStatusMessage;
+const objectsDrawer = document.createElement('div');
+objectsDrawer.id = 'objects';
+objectsDrawer.className = 'objects-drawer';
+const objectList = new ObjectList(objectsDrawer, store);
+objectList.toggle.classList.add('objects-toggle');
+el('canvas').append(objectList.toggle, objectsDrawer);
 // The CSS buffer backs the Theme panel and live theme sync. Like the desktop
 // app it has no sidebar tab of its own — theme.css is edited on disk or
 // through theme adoption, not in this UI.
@@ -883,7 +906,7 @@ function buildToolbar(): void {
     rename: renameDeck,
     onError: (message) => setStatusMessage(`Rename failed: ${message}`),
   });
-  left.append(createDeckWerkButton(), deckNameField.element, divider());
+  left.append(createDeckWerkButton(), deckNameField.element, createHistoryButton(historyHost), divider());
   const fileActions = document.createElement('span');
   fileActions.className = 'toolbar-expanded-file-actions';
   const compactFileEntries: ToolbarPickerEntry[] = [];
@@ -967,9 +990,15 @@ function buildToolbar(): void {
   mid.className = 'bar-group bar-center';
   mid.append(
     // Straight into the new box, its placeholder selected: typing replaces it.
-    barIconButton('Text', TEXT_ICON, () => canvas.beginTextEdit(insertText(store).id)),
+    createTextInsertPicker({
+      textBox: () => canvas.beginTextEdit(insertText(store).id),
+      // A starter listing, selected, so typing replaces it.
+      codeBlock: () => { canvas.beginCodeEdit(insertCode(store).id, 'all'); },
+    }),
     createShapeInsertPicker(store),
+    createPenButton(canvas),
     createTableInsertPicker(store),
+    createMediaButton(mediaHost),
   );
 
   const right = document.createElement('div');
@@ -1090,7 +1119,6 @@ const PANELS = [
   { id: 'inspector', label: 'Props' },
   { id: 'themePanel', label: 'Design' },
   { id: 'timeline', label: 'Build' },
-  { id: 'history', label: 'History' },
   { id: 'chat', label: 'Chat' },
 ] as const;
 

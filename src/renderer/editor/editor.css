@@ -78,6 +78,29 @@ body.mac-titlebar #toolbar { padding-left: 84px; }
   white-space: nowrap;
 }
 .bar-deck-name[hidden] { display: none; }
+.bar-history-button[aria-expanded="true"],
+.bar-icon-button[aria-expanded="true"] { background: var(--panel-2); }
+
+/* Panels opened from the toolbar: the deck's history under its name (it was
+   a sidebar tab) and the media library under Media (#99's tab). */
+.panel-popover {
+  position: fixed;
+  z-index: 10020;
+  display: flex;
+  flex-direction: column;
+  width: 360px;
+  max-height: min(560px, calc(100vh - 80px));
+  overflow-y: auto;
+  padding: 4px 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 14px 38px rgb(0 0 0 / 45%);
+}
+.media-popover { width: 400px; max-height: min(640px, calc(100vh - 80px)); padding: 4px 6px 10px; }
+.panel-popover > #history,
+.panel-popover > #media { padding: 8px 12px 4px; }
 .bar-group {
   display: flex;
   align-items: center;
@@ -121,6 +144,7 @@ body.welcome-mode .toolbar-expanded-file-actions { display: inline-flex; }
 }
 #toolbar.toolbar-compact-secondary .toolbar-expanded-secondary-actions { display: none; }
 #toolbar.toolbar-compact-secondary .toolbar-compact-secondary-action { display: inline-block; }
+#toolbar.toolbar-compact-insert .bar-center :is(.bar-icon-button, .shape-menu-trigger) > span { display: none; }
 
 .bar-right { margin-left: auto; }
 
@@ -382,6 +406,69 @@ body.panel-resizing iframe { pointer-events: none; }
   display: grid;
   place-items: center;
 }
+
+.zoom-controls .light-table-toggle { display: grid; place-items: center; }
+.zoom-controls .light-table-toggle.active { background: var(--accent-soft); color: var(--accent); }
+
+/* The light table (lightTable.ts): every slide as a card over the canvas, the
+   editor's side of Speaker View's G grid. */
+.light-table {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.light-table-header {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 14px 20px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.light-table-header .insp-title { margin: 0; }
+.light-table-header .insp-hint { flex: 1; margin: 0; }
+.light-table-close { flex: none; }
+.light-table-grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 22px 18px;
+  align-content: start;
+  justify-items: center;
+  padding: 18px 20px 28px;
+}
+.light-table-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+.light-table-thumb {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--line), 0 4px 14px rgb(0 0 0 / 30%);
+  pointer-events: none;
+}
+.light-table-card:hover .light-table-thumb { box-shadow: 0 0 0 1px var(--muted), 0 4px 14px rgb(0 0 0 / 30%); }
+.light-table-card.active .light-table-thumb { box-shadow: 0 0 0 2px var(--accent), 0 4px 14px rgb(0 0 0 / 30%); }
+.light-table-card.active { color: var(--accent); }
+.light-table-card.skipped .light-table-thumb { opacity: 0.45; }
+.light-table-card.dragging { opacity: 0.4; }
+.light-table-card.drop-before .light-table-thumb { box-shadow: -4px 0 0 var(--accent), 0 0 0 1px var(--line); }
+.light-table-card.drop-after .light-table-thumb { box-shadow: 4px 0 0 var(--accent), 0 0 0 1px var(--line); }
 
 .zoom-controls .rulers-toggle.active {
   background: var(--accent-soft);
@@ -850,6 +937,69 @@ body.panel-resizing iframe { pointer-events: none; }
   pointer-events: auto;
   transform: translate(-50%, -50%) rotate(45deg) !important;
 }
+
+/* The pen and point editing: the outline being drawn or edited, the segment
+   the next click would add, and the points and their handles — square points,
+   round handles, as in every vector editor. Canvas coordinates, counter-scaled
+   by --inv like the rest of the selection chrome. */
+.canvas-host.pen-tool,
+.canvas-host.pen-tool .stage *,
+.canvas-host.pencil-tool,
+.canvas-host.pencil-tool .stage * { cursor: crosshair !important; }
+
+.path-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.path-overlay path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The pencil's stroke in progress is drawn as the ink it will be. */
+.path-overlay .pencil-overlay-stroke { stroke-linecap: round; stroke-linejoin: round; }
+
+.path-overlay-outline { stroke-width: calc(1.5px * var(--inv)); }
+.path-overlay-stalks { stroke-width: calc(1px * var(--inv)); }
+.path-overlay-preview {
+  stroke-width: calc(1px * var(--inv));
+  stroke-dasharray: calc(4px * var(--inv)) calc(3px * var(--inv));
+}
+
+.path-anchor,
+.path-knob {
+  position: absolute;
+  box-sizing: border-box;
+  width: calc(9px * var(--inv));
+  height: calc(9px * var(--inv));
+  transform: translate(-50%, -50%);
+  border: calc(1.5px * var(--inv)) solid var(--accent);
+  background: #fff;
+  pointer-events: auto;
+  cursor: move;
+}
+
+.path-anchor { border-radius: calc(1.5px * var(--inv)); z-index: 1; }
+.path-anchor.selected { background: var(--accent); }
+/* The first point, under a pen that would close the shape there. */
+.path-anchor.closing {
+  box-shadow: 0 0 0 calc(3px * var(--inv)) color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.path-knob {
+  width: calc(7px * var(--inv));
+  height: calc(7px * var(--inv));
+  border-radius: 50%;
+}
+
+/* A path whose points are being edited shows them, not its box. */
+.sel-box.path-editing { outline: none; }
 
 .guide {
   position: absolute;
@@ -1741,7 +1891,8 @@ input[type="range"] { accent-color: var(--accent); padding: 0; background: trans
   background: var(--panel-2);
 }
 
-.build-element-row {
+.build-element-row,
+.object-list-row {
   display: block;
   overflow: hidden;
   width: 100%;
@@ -1756,9 +1907,11 @@ input[type="range"] { accent-color: var(--accent); padding: 0; background: trans
   cursor: pointer;
 }
 
-.build-element-row:hover { background: rgb(255 255 255 / 6%); }
+.build-element-row:hover,
+.object-list-row:hover:not(.locked) { background: rgb(255 255 255 / 6%); }
 
-.build-element-row.selected {
+.build-element-row.selected,
+.object-list-row.selected {
   background: var(--accent-soft, rgb(59 130 246 / 22%));
   box-shadow: inset 2px 0 0 var(--accent);
 }
@@ -3804,9 +3957,10 @@ button.deck-picker-row.active { border-color: var(--accent); }
 .web-export-detail { margin: 0; min-height: 3.6em; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .pdf-export-builds { padding: 8px 0 4px; }
 
-/* Object names in the build and Morph lists carry colour swatches so two
-   shapes of the same geometry are still told apart at a glance. */
+/* Object names in the build, Morph and object lists carry colour swatches so
+   two shapes of the same geometry are still told apart at a glance. */
 .build-element-row,
+.object-list-row,
 .build-target-name,
 .morph-list-label {
   display: flex;
@@ -3889,6 +4043,39 @@ select.panel-action-select {
   background: var(--panel-2);
   border-color: var(--line);
 }
+
+/* The Pen: the tool itself, and a narrow segment for how it draws. */
+.pen-tool-control { display: inline-flex; }
+.pen-tool-control .pen-tool-button { border-radius: 6px 0 0 6px; }
+.pen-tool-menu {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  padding: 0;
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+}
+.pen-tool-menu svg { color: var(--muted); }
+.pen-tool-menu[aria-expanded="true"] { background: var(--panel-2); border-color: var(--line); }
+/* A menu entry's keyboard shortcut, quiet and to the right of its name. */
+.shape-menu-shortcut {
+  margin-left: auto;
+  padding-left: 16px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+}
+.shape-menu-item:hover:not(:disabled) .shape-menu-shortcut { color: var(--on-accent, #fff); }
+.shape-menu-item[aria-checked] .shape-menu-shortcut + * { margin-left: 0; }
+.shape-menu-item:has(.shape-menu-shortcut)[aria-checked]::after { margin-left: 6px; }
+
+/* The Pen stays pressed while it is drawing. */
+.pen-tool-button[aria-pressed="true"],
+.pen-tool-button[aria-pressed="true"]:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 24%, var(--panel-2));
+}
+.pen-tool-button[aria-pressed="true"] .bar-icon { color: var(--accent); }
 
 .toolbar-split-button {
   display: inline-grid;
@@ -4738,6 +4925,7 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
 .build-element-row[data-kind="image"]::before { content: '▣'; }
 .build-element-row[data-kind="video"]::before { content: '▶'; }
 .build-element-row[data-kind="html"]::before { content: '<>'; letter-spacing: -0.1em; }
+.build-element-row[data-kind="code"]::before { content: '{}'; letter-spacing: -0.1em; }
 .build-element-row[data-kind="unsupported"]::before { content: '?'; }
 .build-element-row[data-kind^="shape"]::before { content: '■'; }
 .build-element-row[data-kind="shape-ellipse"]::before { content: '●'; }
@@ -4806,6 +4994,75 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
 /* Equation builds: the highlight colour spans the card; the pulse size is a small number. */
 .build-card-what > .build-term-color { grid-column: 1 / -1; }
 .build-scale-wrap { width: 72px; }
+
+/* Build order: one compact row per build under the click that starts it, so
+   the slide's choreography reads at a glance (timelinePanel.ts). */
+.build-overview { display: flex; flex-direction: column; gap: 2px; max-height: 340px; overflow-y: auto; }
+.build-overview-step {
+  margin: 8px 0 3px;
+  color: var(--muted);
+  font: 9.5px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.build-overview-step:first-child { margin-top: 0; }
+.build-overview-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "num name effect" "num when when";
+  column-gap: 8px;
+  row-gap: 1px;
+  align-items: center;
+  padding: 5px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.build-overview-row:hover { background: rgb(255 255 255 / 5%); }
+.build-overview-row.selected { border-color: var(--accent); background: var(--accent-soft); }
+.build-overview-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.build-overview-row.dragging { opacity: 0.4; }
+.build-overview-row[data-drop-mode="before"] { box-shadow: inset 0 2px 0 var(--accent); }
+.build-overview-row[data-drop-mode="after"] { box-shadow: inset 0 -2px 0 var(--accent); }
+.build-overview-row[data-drop-mode="fuse"] { outline: 2px solid var(--accent); background: var(--accent-soft); }
+.build-overview-row > .build-num { grid-area: num; }
+.build-overview-row > .build-target-name { grid-area: name; overflow: hidden; font-size: 11px; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.build-overview-effect { grid-area: effect; color: var(--text); font: 10.5px var(--mono); white-space: nowrap; }
+.build-overview-when { grid-area: when; color: var(--muted); font: 10px var(--mono); }
+/* A build that runs on its own (after or with the one before) sits under it. */
+.build-overview-row:not([data-trigger="click"]) { margin-left: 14px; }
+
+/* The picked build's settings: a label column and the control beside it. */
+.build-detail-section .timeline-row { padding: 2px 0 0; }
+.build-detail-section .build-card-body.build-field {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+  padding-left: 0;
+}
+.build-field > .build-trigger-strip,
+.build-field > .build-action,
+.build-field > select:not(.build-trigger) { grid-column: 2; min-width: 0; }
+.build-field > .build-action ~ * { grid-column: 2; }
+.build-field > .build-trigger-strip { display: grid; grid-auto-flow: row; grid-template-columns: minmax(0, 1fr); }
+.build-field > .build-trigger-strip .segment-button { justify-content: flex-start; text-align: left; padding: 0 10px; }
+.build-wait { display: inline-flex; align-items: center; gap: 6px; }
+.build-wait-label { min-width: 104px; color: var(--muted); font: 10.5px var(--mono); text-align: center; }
+.build-wait-step {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+}
+.build-wait-step:disabled { opacity: 0.4; }
+.build-field .build-trigger-strip .segment-button { height: 26px; font-size: 10.5px; white-space: nowrap; }
+.build-field > .build-delay-wrap,
+.build-field > .build-duration-wrap,
+.build-field > .pop-size { justify-self: start; }
+.build-timing-sentence { margin: 2px 0 0; }
 .build-scale-wrap > input { padding: 3px 20px 3px 6px; height: 24px; width: 100%; }
 /* A shadow's direction: the knob, then Angle and Distance. */
 .shadow-direction-row { grid-template-columns: 40px repeat(2, minmax(0, 1fr)); }
@@ -4837,6 +5094,13 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
 .pop-size { width: 76px; }
 .pop-size > input { width: 100%; padding: 3px 24px 3px 6px; height: 24px; }
 .timeline-row select.build-action, .timeline-row select.build-term { padding: 2px 20px 2px 6px; height: 24px; font: 10.5px var(--mono); }
+/* A build on some of a code block's lines: which lines, and a button to move it to the picked ones. */
+.build-lines-label { font: 10.5px var(--mono); color: var(--text); }
+.build-lines-use { margin-left: auto; padding: 2px 6px; font-size: 11px; }
+.build-line-text { font-family: var(--mono); white-space: pre; }
+/* A highlight's tint sits in its labelled row; the swatch carries no label of its own. */
+.build-line-color { margin: 0; padding: 0; border: 0; justify-content: flex-start; }
+.build-line-color > span:first-child { display: none; }
 .timeline-row select.build-trigger { flex: none; }
 
 /* --- Design: canvas previews, the Props layout picker, rail design captions --- */
@@ -4962,4 +5226,143 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
   text-decoration: underline wavy #3e8ef7;
   text-decoration-thickness: 1.5px;
   text-underline-offset: 3px;
+}
+
+/* --- object list --- */
+
+/* A drawer over the canvas, opened from a floating icon in its top-left
+   corner the way the notes open from the bottom-left one. Closed, only the
+   icon shows; it moves aside for the rulers as the notes toggle does. */
+.objects-toggle {
+  position: absolute;
+  z-index: 21;
+  left: 12px;
+  top: 12px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 35%);
+  cursor: pointer;
+}
+.objects-toggle:hover { background: var(--panel-2); }
+.objects-toggle[aria-pressed="true"] { color: var(--accent); }
+.canvas-host.rulers-shown > .objects-toggle { left: calc(20px + 12px); top: calc(20px + 12px); }
+.canvas-host.welcome-mode > .objects-toggle,
+.canvas-host.welcome-mode > .objects-drawer { display: none; }
+
+.objects-drawer {
+  position: absolute;
+  z-index: 20;
+  left: 12px;
+  top: 48px;
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  max-height: calc(100% - 48px - 56px);
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 16px 40px rgb(0 0 0 / 40%);
+}
+.objects-drawer.collapsed { display: none; }
+.canvas-host.notes-open > .objects-drawer { max-height: calc(100% - 48px - 56px - var(--notes-drawer-height, 180px)); }
+.canvas-host.rulers-shown > .objects-drawer { left: calc(20px + 12px); top: calc(20px + 48px); }
+
+.object-list-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px 4px;
+}
+.object-list-header .insp-title { flex: 1; margin: 0; }
+.object-list-count { color: var(--muted); font: 10.5px var(--mono); }
+.object-list-hint { margin: 0; padding: 4px 12px 8px; }
+
+.object-list-rows {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 12px;
+  border-top: 1px solid var(--line);
+}
+.object-list-empty { margin: 0; padding: 10px 14px; }
+.object-list-row {
+  flex: none;
+  gap: 8px;
+  height: 46px;
+  padding: 0 14px 0 8px;
+  cursor: grab;
+}
+.object-list-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.object-list-row.locked { color: var(--muted); cursor: default; }
+.object-list-row.locked .object-list-thumb { opacity: 0.5; }
+.object-list-row.dragging { opacity: 0.4; }
+.object-list-row.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.object-list-row.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+
+/* The object's miniature, drawn by the player like a rail thumbnail. The box
+   matches THUMB_W x THUMB_H in objectList.ts. */
+.object-list-thumb {
+  position: relative;
+  flex: none;
+  overflow: hidden;
+  width: 54px;
+  height: 36px;
+  background: var(--bg);
+  /* Decorative: presses and drags belong to the row. */
+  pointer-events: none;
+}
+.object-list-thumb > .rail-thumb-inner { overflow: hidden; }
+/* The frame's stroke sits over the drawing, which fills the whole box. */
+.object-list-thumb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.object-list-row.selected .object-list-thumb::after { box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* Interface size in the browser editor (uiScale.ts): the chrome is zoomed and
+   the slide canvas is not, so pointer maths on the canvas stay exact. */
+:root[data-ui-zoom] :is(#toolbar, #rail, #side, #status, .ui-menu, .ui-help-popover, .panel-popover,
+  .color-picker-popover, .workflow-dialog, .canvas-host > .zoom-controls, .canvas-host > .notes-toggle,
+  .canvas-host > .objects-toggle, .canvas-host > .objects-drawer) { zoom: var(--ui-zoom); }
+
+/* --- Code blocks on the canvas ----------------------------------------- */
+
+/* Lines picked in a selected block's gutter, for a build on just those lines. */
+.code-line-pick {
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+  /* Translucent whatever the chrome theme: the picked code must stay readable. */
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  outline: calc(1.5px * var(--inv)) solid var(--accent);
+  outline-offset: 0;
+}
+
+/* Typing into a code block: the textarea's glyphs are the highlighted ones
+   drawn under it, so only its caret and its selection show. */
+.code-edit-input::selection { background: rgb(80 140 255 / 38%); color: transparent; }
+.code-edit-input:focus { outline: none; }
+
+/* The language picker that floats at the top-right corner of a block being
+   edited: the app's own select, at toolbar density, on a solid ground so it
+   reads over any slide. */
+.code-language-select {
+  position: absolute;
+  z-index: 20;
+  max-width: 180px;
+  padding: 3px 22px 3px 8px;
+  font-size: 12px;
+  background-color: var(--panel);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
 }

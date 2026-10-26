@@ -1,6 +1,6 @@
 import type { AgentOperation } from './agent.js';
-import { MediaEffectSchema, MIRRORED_TEXT_STYLE_PROPERTIES, SlideSchema } from './deck.js';
-import type { Deck, MediaEffect, Slide, SlideElement, TimelineEntry } from './deck.js';
+import { MediaEffectSchema, MIRRORED_TEXT_STYLE_PROPERTIES, SlideSchema, STROKE_DASHES, STROKE_STYLES } from './deck.js';
+import type { Deck, MediaEffect, Slide, SlideElement, StrokeDash, StrokeStyle, TimelineEntry } from './deck.js';
 import { fitAutoTextElement } from './autoFit.js';
 import { KATEX_AUTO_RENDER_JS, KATEX_CSS, KATEX_JS } from './katexInline.js';
 import {
@@ -11,6 +11,9 @@ import {
 } from './equationBuildHtml.js';
 import { shapeSvg } from './shapeSvg.js';
 import { bakeEndpointFlips, canonicalOrientation, elementTransform, orientationFromMatrix, sameOrientation } from './flip.js';
+import { codeElementFromNode, codeElementToHtml, lineBuildsFromNode } from './codeHtml.js';
+import { formatLineBuilds } from './codeBlocks.js';
+import { CODE_AUTHORING_CSS } from './codeBlocks.js';
 import { applyTableColumnWidths } from './paragraphs.js';
 import { normalizeHtmlLineHeights, normalizeStyleLineHeight } from './lineHeight.js';
 import { compareDataAttrs, compareFromDataset, syncLengthFromDataset } from './compare.js';
@@ -432,7 +435,7 @@ export function authoringCss(canvas: { w: number; h: number }): string {
      and clamping it to the slide silently resizes the object. The slide clips
      what overflows, which is what the player does too. */
   img, video { display: block; }
-`;
+${CODE_AUTHORING_CSS}`;
 }
 
 /** Read the original ordered scope from an exported HTML document. */
@@ -852,17 +855,45 @@ function mergedTimeline(previous: Slide, compiled: Slide, theirs = new Set<strin
   // Keyed by kind and object: a page states an object's appearance, and its
   // equation builds (`equationBuildHtml.ts`), each separately.
   const authored = new Map<string, TimelineEntry>();
+  // A code block's line builds (`data-build-lines`) are the page's to state
+  // too, all of them, in order.
+  const authoredLines = new Map<string, TimelineEntry[]>();
   for (const entry of compiled.timeline) {
     // An object kept as somebody else left it keeps the builds they gave it.
     if (theirs.has(entry.action.target)) continue;
     const kind = pageBuildKind(entry);
     if (kind && !authored.has(kind)) authored.set(kind, entry);
+    if (entry.action.type === 'lines') {
+      authoredLines.set(entry.action.target, [...(authoredLines.get(entry.action.target) ?? []), entry]);
+    }
   }
   const claimed = new Set<string>();
+  /** Per block, how many of the page's line builds a deck build has taken. */
+  const claimedLines = new Map<string, number>();
   const merged: TimelineEntry[] = [];
   for (const entry of previous.timeline) {
     const { target } = entry.action;
     if (!present.has(target)) continue;
+    if (entry.action.type === 'lines' && !theirs.has(target)) {
+      // The block's line builds pair up in order: the n-th the deck has takes
+      // the n-th the page states — what it does and to which lines — and
+      // keeps its trigger, its colour and its place among the other builds.
+      const taken = claimedLines.get(target) ?? 0;
+      const page = authoredLines.get(target)?.[taken];
+      // The page took this line build off the block.
+      if (!page) continue;
+      claimedLines.set(target, taken + 1);
+      const { lines: _lines, ...action } = structuredClone(entry.action);
+      merged.push({
+        ...structuredClone(entry),
+        action: {
+          ...action,
+          value: page.action.value,
+          ...(page.action.lines ? { lines: page.action.lines } : {}),
+        },
+      });
+      continue;
+    }
     const kind = pageBuildKind(entry);
     const page = kind ? authored.get(kind) : undefined;
     // The page took the build off this object.
@@ -894,6 +925,14 @@ function mergedTimeline(previous: Slide, compiled: Slide, theirs = new Set<strin
     if (theirs.has(entry.action.target)) continue;
     const kind = pageBuildKind(entry);
     if (kind && claimed.has(kind)) continue;
+    if (entry.action.type === 'lines') {
+      // The first ones were taken by the deck's own line builds above.
+      const taken = claimedLines.get(entry.action.target) ?? 0;
+      if (taken > 0) {
+        claimedLines.set(entry.action.target, taken - 1);
+        continue;
+      }
+    }
     merged.push({ ...entry, id: uniqueId(entry.id, ids) });
   }
   return merged;
@@ -1001,7 +1040,11 @@ function buildSpec(slide: Slide, elementId: string): string {
   if (entry && isEffectName(entry.action.value)) {
     spec += `~${entry.action.value}/${entry.action.duration ?? ''}${popSpec(entry)}`;
   }
-  return spec + equationBuildSpec(slide, elementId);
+  spec += equationBuildSpec(slide, elementId);
+  // A code block's line builds are stated by its page as well; said only when
+  // there are some, so every other object's fingerprint is what it was.
+  const lines = slide.timeline.filter((candidate) => candidate.action.type === 'lines' && candidate.action.target === elementId);
+  return lines.length > 0 ? `${spec}|lines:${formatLineBuilds(lines)}` : spec;
 }
 
 /** A pop's sizes, when it states any; empty otherwise, so other builds fingerprint as before. */
@@ -1309,6 +1352,7 @@ export function slideFromMeasured(
     const build = buildFromNode(node, id, timeline.length);
     if (build) timeline.push(build);
     timeline.push(...equationBuildsFromNode(node, id, timeline.length));
+    if (element.type === 'code') timeline.push(...lineBuildsFromNode(node, id, timeline.length));
   });
 
   return {
@@ -1472,8 +1516,17 @@ function elementFromMeasured(
       ...(node.dataset.control ? { control: { x: cx, y: cy } } : {}),
       ...(Number.isFinite(Number.parseFloat(node.dataset.braceDepth ?? ''))
         ? { braceDepth: Number.parseFloat(node.dataset.braceDepth ?? '') } : {}),
+      ...((STROKE_STYLES as readonly string[]).includes(node.dataset.strokeStyle ?? '')
+        && node.dataset.strokeStyle !== 'pen'
+        ? { strokeStyle: node.dataset.strokeStyle as StrokeStyle } : {}),
+      ...((STROKE_DASHES as readonly string[]).includes(node.dataset.strokeDash ?? '')
+        ? { strokeDash: node.dataset.strokeDash as StrokeDash } : {}),
+      ...(node.dataset.startCap === 'dot' || node.dataset.startCap === 'bar' ? { startCap: node.dataset.startCap } : {}),
+      ...(node.dataset.endCap === 'dot' || node.dataset.endCap === 'bar' ? { endCap: node.dataset.endCap } : {}),
     };
   }
+
+  if (node.dataset.element === 'code') return codeElementFromNode(node, base);
 
   // A sandboxed web page. Its box is what the browser measured; everything
   // else rides on data attributes, because the page itself never enters the
@@ -1655,8 +1708,12 @@ export function slideToHtml(slide: Slide, canvas: { w: number; h: number }): str
   // An object's first appearance is the one its markup states; the compile
   // pairs the page's build with that same entry (`carrySlideState`).
   const builds = new Map<string, TimelineEntry>();
+  const lineBuilds = new Map<string, TimelineEntry[]>();
   for (const entry of slide.timeline) {
     if (entry.action.type === 'appear' && !builds.has(entry.action.target)) builds.set(entry.action.target, entry);
+    if (entry.action.type === 'lines') {
+      lineBuilds.set(entry.action.target, [...(lineBuilds.get(entry.action.target) ?? []), entry]);
+    }
   }
 
   // What this slide is now, so a save of the page can tell its own edits
@@ -1666,6 +1723,7 @@ export function slideToHtml(slide: Slide, canvas: { w: number; h: number }): str
     .sort((a, b) => a.z - b.z)
     .map((element) => elementToHtml(
       element, builds.get(element.id), stamp.elements[element.id], equationBuildAttributes(slide, element.id),
+      lineBuilds.get(element.id),
     ))
     .join('\n');
 
@@ -1691,7 +1749,9 @@ export function slideToHtml(slide: Slide, canvas: { w: number; h: number }): str
     + `${background}>\n${body}\n</section>\n`;
 }
 
-function elementToHtml(element: SlideElement, build?: TimelineEntry, base?: string, extraAttrs: string[] = []): string {
+function elementToHtml(
+  element: SlideElement, build?: TimelineEntry, base?: string, extraAttrs: string[] = [], lineBuilds: TimelineEntry[] = [],
+): string {
   const position = `position:absolute; left:${element.x}px; top:${element.y}px;`
     + ` width:${element.w}px; height:${element.h}px;`
     + (elementTransform(element) ? ` transform:${elementTransform(element)};` : '')
@@ -1838,6 +1898,10 @@ function elementToHtml(element: SlideElement, build?: TimelineEntry, base?: stri
         + (element.arrowSize !== undefined ? ` data-arrow-size="${element.arrowSize}"` : '')
         + (element.control ? ` data-control="${element.control.x},${element.control.y}"` : '')
         + (element.braceDepth !== undefined ? ` data-brace-depth="${element.braceDepth}"` : '')
+        + (element.strokeStyle && element.strokeStyle !== 'pen' ? ` data-stroke-style="${element.strokeStyle}"` : '')
+        + (element.strokeDash ? ` data-stroke-dash="${element.strokeDash}"` : '')
+        + (element.startCap ? ` data-start-cap="${element.startCap}"` : '')
+        + (element.endCap ? ` data-end-cap="${element.endCap}"` : '')
         + attr('data-path', element.path)
         + (element.pathSize ? ` data-path-size="${element.pathSize.w},${element.pathSize.h}"` : '')
         // Paint effects live on the wrapper rather than the nested SVG. Give
@@ -1866,6 +1930,8 @@ function elementToHtml(element: SlideElement, build?: TimelineEntry, base?: stri
             + `font:24px system-ui,sans-serif;color:#667;background:#eef0f3;border:2px dashed #99a;box-sizing:border-box;">`
             + `web page: ${escape(element.title || element.src)}</div>`)
         + '</div>';
+    case 'code':
+      return codeElementToHtml(element, attrs, styleAttr, position, inline, lineBuilds);
     case 'unsupported':
       // An import gap, described well enough to be fixed: replace this element
       // with real markup and it becomes a real object on the way back.
