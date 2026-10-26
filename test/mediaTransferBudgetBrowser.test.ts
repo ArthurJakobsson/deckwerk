@@ -925,6 +925,287 @@ async function waitingClip(kind: BrowserKind): Promise<{
   return { log, renditions, source, size: (await stat(source)).size, shownAt };
 }
 
+/**
+ * A talk of photos and clips, as a Keynote import leaves it: photos with no
+ * hash in their names, an image-heavy slide right after each clip, clips big
+ * enough that downloading one holds the link for seconds.
+ */
+const PHOTOS_DECK = 'photos';
+/** Seconds of each clip: about 11 MB, three seconds of the link. */
+const PHOTOS_CLIP_SECONDS = 60;
+
+async function makePhoto(out: string, size: string, seed: number): Promise<void> {
+  // Noise, so a photo weighs what a photo weighs (a test pattern compresses to nothing).
+  await execFileAsync(ffmpeg, [
+    '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', `testsrc2=size=${size}`, '-vf', `noise=alls=10:allf=t:all_seed=${seed}`,
+    '-frames:v', '1', '-q:v', '5', out,
+  ]);
+}
+
+function photosDeck(photos: string[], clips: string[]): Deck {
+  const deck = emptyDeck('Photos and clips');
+  const base = deck.slides[0];
+  let next = 0;
+  const grid = (count: number): SlideElement[] => Array.from({ length: count }, (_, i) => ({
+    ...image(`p${next}`, photos[next++], 60 + (i % 4) * 460),
+    y: 220 + Math.floor(i / 4) * 300, w: 440, h: 280,
+  }) as SlideElement);
+  const slide = (n: number, elements: SlideElement[]) => ({ ...base, id: `s${n}`, elements: [text(`t${n}`, `SLIDE ${n}`), ...elements] });
+  deck.slides = [
+    slide(1, grid(2)),
+    slide(2, [video('c1', clips[0], 400, { autoplay: true })]),
+    slide(3, grid(8)),
+    slide(4, [video('c2', clips[1], 100, { autoplay: true }), ...grid(1)]),
+    slide(5, grid(6)),
+    slide(6, []),
+  ];
+  if (next !== photos.length) throw new Error(`the fixture places ${next} of ${photos.length} photos`);
+  return deck;
+}
+
+/** What each slide's images looked like in the frame the slide first appeared in. */
+interface FirstFrame {
+  slide: string;
+  images: number;
+  /** Images not complete, decoded and visible in that frame. */
+  missing: string[];
+}
+
+/**
+ * Record, for every slide the Player puts on its stage, which images were not
+ * on screen with it. A MutationObserver runs before the browser next renders,
+ * so this is the frame the slide is first painted in.
+ */
+const watchFirstFrames = (target: string) => `(() => {
+  const win = ${target};
+  const doc = win.document;
+  win.__firstFrames = [];
+  win.__firstFrameWatch?.disconnect();
+  const stage = doc.getElementById('stage');
+  let last = null;
+  win.__firstFrameWatch = new win.MutationObserver(() => {
+    const root = stage.querySelector('.stage > .slide');
+    if (!root || root === last) return;
+    last = root;
+    const images = [...root.querySelectorAll('img')];
+    const missing = images.filter((i) => !(i.complete && i.naturalWidth > 0 && win.getComputedStyle(i).visibility !== 'hidden'))
+      .map((i) => (i.getAttribute('src') || 'no src').split('/').pop().slice(0, 8)
+        + ' (complete ' + i.complete + ', ' + i.naturalWidth + ' px, ' + (i.style.visibility || 'visible') + ')');
+    win.__firstFrames.push({ slide: root.dataset.slideId, images: images.length, missing });
+  });
+  win.__firstFrameWatch.observe(stage, { childList: true, subtree: true });
+  return true;
+})()`;
+
+const PRESENT_FRAME = `document.querySelector('iframe').contentWindow`;
+
+/** A clip on the stage, watched for up to three seconds: is it playing? */
+interface ClipSample {
+  slide: string;
+  readyState: number;
+  from: number;
+  to: number;
+  error: number | null;
+  /** How long its time took to move, from the first look. */
+  waitedMs: number;
+}
+
+const sampleClips = (target: string) => `(async () => {
+  const win = ${target};
+  const videos = [...win.document.querySelectorAll('#stage .stage > .slide video')];
+  const first = videos.map((v) => v.currentTime);
+  const started = performance.now();
+  const moved = () => videos.every((v, i) => v.currentTime > first[i]);
+  while (!moved() && performance.now() - started < 3000) await new Promise((resolve) => setTimeout(resolve, 100));
+  return videos.map((v, i) => ({
+    slide: v.closest('.slide')?.dataset.slideId ?? '?',
+    readyState: v.readyState, from: first[i], to: v.currentTime, error: v.error?.code ?? null,
+    waitedMs: Math.round(performance.now() - started),
+  }));
+})()`;
+
+/** Clips that were not playing when sampled: no frame, a failed load, or time standing still. */
+function stalledClips(samples: ClipSample[]): string[] {
+  return samples.filter((s) => s.readyState < 2 || s.error !== null || !(s.to > s.from))
+    .map((s) => `${s.slide}: readyState ${s.readyState}, currentTime ${s.from} → ${s.to} in ${s.waitedMs} ms, error ${s.error}`);
+}
+
+/** Jump the way Speaker View does: a goTo on the presentation bus. */
+const jumpTo = (target: string, slide: number) => `(() => {
+  const win = ${target};
+  const bus = new win.BroadcastChannel('deckwerk-present:${PHOTOS_DECK}');
+  bus.postMessage({ kind: 'command', command: { type: 'goTo', slide: ${slide} } });
+  bus.close();
+  return true;
+})()`;
+
+async function presentKey(page: Page, target: string, key: string): Promise<void> {
+  await page.evaluate(`(() => {
+    const win = ${target};
+    win.dispatchEvent(new win.KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true }));
+    return true;
+  })()`);
+}
+
+/**
+ * Present the deck cold, in a page of its own, then move about it; open the
+ * editor and present it twice from there. Every step waits about as long as
+ * a presenter talks over a slide, and each presentation is given the time to
+ * fetch the talk's photos before it moves. A jump goes to a slide shown
+ * before in the same presentation (Home, to where it opened): a slide never
+ * shown nor about to be may decode its photos a frame late.
+ */
+async function presentingPhotos(kind: BrowserKind): Promise<{
+  log: TransferLog; photos: string[]; frames: Record<string, FirstFrame[]>;
+  offline: { clips: ClipSample[]; attempts: Array<{ method: string; url: string }>; moves: number };
+}> {
+  const { decksRoot, profileDir } = await freshWorkDir('photos');
+  const deckDir = join(decksRoot, PHOTOS_DECK);
+  await mkdir(join(deckDir, 'assets'), { recursive: true });
+  const photos = Array.from({ length: 17 }, (_, i) => `assets/photo-${i + 1}.jpg`);
+  const clips = ['assets/talk-clip-1.mp4', 'assets/talk-clip-2.mp4'];
+  await Promise.all([
+    ...photos.map((photo, i) => makePhoto(join(deckDir, photo), '1600x1000', i + 1)),
+    makeClip(join(deckDir, clips[0]), PHOTOS_CLIP_SECONDS, true),
+    makeClip(join(deckDir, clips[1]), PHOTOS_CLIP_SECONDS, true, 'mandelbrot'),
+  ]);
+  const deck = photosDeck(photos, clips);
+  await saveDeck(deckDir, deck);
+  await writeFile(join(deckDir, 'theme.css'), '.slide { background: #fff; color: #111; }\n', 'utf8');
+  let photoBytes = 0;
+  for (const photo of photos) photoBytes += (await stat(join(deckDir, photo))).size;
+
+  const { page, log, origin } = await startSession(kind, decksRoot, profileDir);
+  for (const file of [...photos, ...clips]) await log.learn(PHOTOS_DECK, file);
+  const slides = deck.slides.length;
+  const frames: Record<string, FirstFrame[]> = {};
+  const collect = async (name: string, target: string) => {
+    frames[name] = [...frames[name] ?? [], ...await page.evaluate<FirstFrame[]>(`${target}.__firstFrames`)];
+  };
+  const talk = () => new Promise((resolve) => setTimeout(resolve, 1_500));
+
+  // Long enough for every photo to cross the link twice over: the background
+  // fetch has reached every slide by the time the talk does.
+  const settle = Math.max(4_000, Math.round((2 * photoBytes * 1000) / LINK.bytesPerSecond));
+  await phase(log, 'present-cold', async () => {
+    await page.goto(`${origin}/present.html?deck=${PHOTOS_DECK}`);
+    await eventually(
+      () => page.evaluate<boolean>(`Boolean(document.querySelector('#stage .slide'))`),
+      'the presentation stayed blank', Boolean, 60_000,
+    );
+    await page.evaluate(watchFirstFrames('window'));
+    await new Promise((resolve) => setTimeout(resolve, settle));
+    for (let i = 1; i < slides; i++) {
+      await presentKey(page, 'window', 'ArrowRight');
+      await talk();
+    }
+    await collect('present-cold', 'window');
+  });
+
+  await phase(log, 'present-again', async () => {
+    await page.evaluate(watchFirstFrames('window'));
+    for (let i = 1; i < slides; i++) {
+      await presentKey(page, 'window', 'ArrowLeft');
+      await talk();
+    }
+    await presentKey(page, 'window', 'Home');
+    await talk();
+    for (let i = 1; i < slides; i++) {
+      await presentKey(page, 'window', 'ArrowRight');
+      await talk();
+    }
+    await collect('present-again', 'window');
+  });
+
+  await phase(log, 'editor', async () => {
+    await page.goto(`${origin}/?deck=${PHOTOS_DECK}&name=Budget`);
+    await waitForEditor(page, slides);
+    await browseAll(page, slides);
+  });
+
+  for (const name of ['editor-present', 'editor-present-again']) {
+    await showSlide(page, 0);
+    await phase(log, name, async () => {
+      await page.evaluate(`(() => {
+        const present = [...document.querySelectorAll('#toolbar button')]
+          .filter((button) => button.textContent?.trim() === 'Present')
+          .find((button) => button.getClientRects().length > 0);
+        present.click();
+        return true;
+      })()`);
+      await eventually(
+        () => page.evaluate<boolean>(`Boolean(document.querySelector('iframe')?.contentDocument?.querySelector('#stage .slide'))`),
+        'the presentation stayed blank', Boolean, 60_000,
+      );
+      await page.evaluate(watchFirstFrames(PRESENT_FRAME));
+      await new Promise((resolve) => setTimeout(resolve, settle));
+      for (let i = 1; i < slides; i++) {
+        await presentKey(page, PRESENT_FRAME, 'ArrowRight');
+        await talk();
+      }
+      await presentKey(page, PRESENT_FRAME, 'ArrowLeft');
+      await talk();
+      await presentKey(page, PRESENT_FRAME, 'Home');
+      await talk();
+      await presentKey(page, PRESENT_FRAME, 'ArrowRight');
+      await talk();
+      await collect(name, PRESENT_FRAME);
+      await page.evaluate(`(window.postMessage({ type: 'present-exit' }, location.origin), true)`);
+      await eventually(
+        () => page.evaluate<boolean>(`!document.querySelector('iframe')`),
+        'the presentation overlay never closed', Boolean, 30_000,
+      );
+    });
+  }
+
+  // The connection goes once the talk is in memory, as a tailnet route
+  // drops mid-talk: the show goes on, forward, back, home, end and a jump.
+  const offline = { clips: [] as ClipSample[], attempts: [] as Array<{ method: string; url: string }>, moves: 0 };
+  await showSlide(page, 0);
+  await phase(log, 'offline', async () => {
+    await page.evaluate(`(() => {
+      const present = [...document.querySelectorAll('#toolbar button')]
+        .filter((button) => button.textContent?.trim() === 'Present')
+        .find((button) => button.getClientRects().length > 0);
+      present.click();
+      return true;
+    })()`);
+    await eventually(
+      () => page.evaluate<boolean>(`Boolean(${PRESENT_FRAME}?.deckwerkPresentationMemory?.holdsAll())`),
+      'the presentation never held the whole talk in memory', Boolean, 120_000,
+    );
+    link!.cut();
+    await page.evaluate(watchFirstFrames(PRESENT_FRAME));
+    const move = async (act: () => Promise<void>) => {
+      await act();
+      offline.moves += 1;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      offline.clips.push(...await page.evaluate<ClipSample[]>(sampleClips(PRESENT_FRAME)));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    };
+    for (let i = 1; i < slides; i++) await move(() => presentKey(page, PRESENT_FRAME, 'ArrowRight'));
+    for (let i = 1; i < slides; i++) await move(() => presentKey(page, PRESENT_FRAME, 'ArrowLeft'));
+    await move(async () => { await page.evaluate(jumpTo(PRESENT_FRAME, slides - 1)); });
+    await move(() => presentKey(page, PRESENT_FRAME, 'Home'));
+    await move(async () => { await page.evaluate(jumpTo(PRESENT_FRAME, 3)); });
+    await move(async () => { await page.evaluate(jumpTo(PRESENT_FRAME, 1)); });
+    await collect('offline', PRESENT_FRAME);
+    offline.attempts = link!.attempts.map(({ method, url }) => ({ method, url }));
+  });
+
+  console.log(`media transfer budget (${kind}, presenting photos) — first frames:\n${JSON.stringify(frames, null, 1)}`);
+  console.log(`media transfer budget (${kind}, presenting photos) — offline:\n${JSON.stringify(offline, null, 1)}`);
+  console.log(`media transfer budget (${kind}, presenting photos) — every asset response:\n${TransferLog.table(repeats(log.all()))}`);
+  return { log, photos, frames, offline };
+}
+
+/** Slides that appeared without all of their images. */
+function lateImages(frames: FirstFrame[]): string[] {
+  return frames.filter((frame) => frame.missing.length > 0)
+    .map((frame) => `${frame.slide}: ${frame.missing.length} of ${frame.images} images not on screen (${frame.missing.join(', ')})`);
+}
+
 /* ------------------------------------------------------------------------ */
 /* The suite                                                                 */
 /* ------------------------------------------------------------------------ */
@@ -986,13 +1267,10 @@ for (const kind of ffmpeg ? BROWSERS : []) describe(`media transfer budget (${ki
     // before the presentation fetches the remainder. A fast-start remux as the
     // streaming version of such clips would cut both.
     //
-    // PENDING(content-addressed images) in Safari: clips cost one request
-    // each for the whole session, but the unhashed diagram is served
-    // `no-cache`, and a document Safari reloaded revalidates such a file
-    // each time it is shown (eight 304s while the reloaded editor browsed).
-    // Serving images from /media/<key> immutably, as clips are, would leave
-    // nothing to revalidate.
-    pendingIn('Chromium', 'Safari')(`takes at most ${REQUESTS_PER_FILE} requests per file over the session`, () => {
+    // Safari met this budget once pictures were served from /media/<key>
+    // immutably (Oct 2026): before, a document it had reloaded revalidated
+    // the unhashed diagram, served `no-cache`, each time it was shown.
+    pendingIn('Chromium')(`takes at most ${REQUESTS_PER_FILE} requests per file over the session`, () => {
       expect(overRequestBudget(log.all())).toEqual([]);
     });
   });
@@ -1020,6 +1298,68 @@ for (const kind of ffmpeg ? BROWSERS : []) describe(`media transfer budget (${ki
 
     it('asks for each version of a clip under one URL', () => {
       expect(severalUrls(log.all())).toEqual([]);
+    });
+  });
+
+  // Presenting a hosted talk, Oct 2026: every slide appeared at once, and its
+  // photos seconds later (15 s for one 4.7 MB photo). The presentation spent
+  // the link on the next slides' clips first, looked only two slides ahead
+  // for photos, and revalidated every photo it had already seen, each 304
+  // queued behind a clip's download.
+  describe('presenting a talk of photos and clips', () => {
+    let result: Awaited<ReturnType<typeof presentingPhotos>>;
+    beforeAll(async () => {
+      result = await presentingPhotos(kind);
+    }, 600_000);
+    afterAll(teardown);
+    const photoRequests = (phases?: string[]) => result.log.all()
+      .filter((r) => result.photos.includes(r.path) && (!phases || phases.includes(r.phase)));
+
+    it('fixture: every slide was shown and checked', () => {
+      for (const name of ['present-cold', 'present-again', 'editor-present', 'editor-present-again']) {
+        expect(result.frames[name]?.length ?? 0, name).toBeGreaterThanOrEqual(5);
+      }
+      expect(result.frames['present-cold'].some((frame) => frame.images >= 8)).toBe(true);
+    });
+
+    it("shows each slide's photos in the frame the slide appears, once the background fetch has reached it", () => {
+      expect(lateImages(result.frames['present-cold'])).toEqual([]);
+    });
+
+    it("shows each slide's photos with it moving back, jumping and presenting again", () => {
+      expect([
+        ...lateImages(result.frames['present-again']),
+        ...lateImages(result.frames['editor-present']),
+        ...lateImages(result.frames['editor-present-again']),
+      ]).toEqual([]);
+    });
+
+    it('downloads each photo once, under one URL', () => {
+      const violations: string[] = [];
+      for (const [, served] of groupBy(photoRequests(), (r) => r.content)) {
+        const urls = new Set(served.map((r) => r.url));
+        if (served.length !== 1 || urls.size !== 1) {
+          violations.push(`${where(served)}: ${served.length} requests under ${urls.size} URLs\n${TransferLog.table(served)}`);
+        }
+      }
+      expect(violations).toEqual([]);
+      expect(new Set(photoRequests().map((r) => r.content)).size).toBe(result.photos.length);
+    });
+
+    // "Once everything is downloaded, it should be possible to present the
+    // slides even if the connection to the server is subsequently lost."
+    it('presents the whole talk from memory once the connection is lost', () => {
+      expect(result.offline.moves).toBeGreaterThanOrEqual(2 * 5 + 4);
+      expect(result.frames.offline?.length ?? 0).toBeGreaterThanOrEqual(2 * 5 + 2);
+      expect(lateImages(result.frames.offline)).toEqual([]);
+      expect(result.offline.clips.length, 'clips sampled after the cut').toBeGreaterThanOrEqual(4);
+      expect(stalledClips(result.offline.clips)).toEqual([]);
+      const media = result.offline.attempts.filter((a) => /^\/(?:media|decks)\//.test(a.url));
+      expect(media, 'media requests after the connection was lost').toEqual([]);
+    });
+
+    it('asks the server nothing about a photo once it has arrived: moving about, the editor, presenting again', () => {
+      expect(anyTransfer(photoRequests(['present-again', 'editor', 'editor-present', 'editor-present-again']))).toEqual([]);
     });
   });
 

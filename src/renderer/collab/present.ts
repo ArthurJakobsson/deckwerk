@@ -20,7 +20,7 @@ import { PlayerPaintReadiness } from './playerReadiness.js';
 import { createPresentationBus, type PresentationRole } from './presentationBus.js';
 import { mediaVariantsSnapshot, pinMediaVariant, setMediaVariants } from './mediaVariants.js';
 import { trackVideoLoading } from '../player/videoLoadingProgress.js';
-import { VideoBlobCache } from '../player/videoBlobCache.js';
+import { MediaBlobCache } from '../player/mediaBlobCache.js';
 import { eventOnInteractiveWeb, slideLinkFromEvent } from '../player/links.js';
 import { selectionPreventsAdvance } from '../player/presentationPointer.js';
 import type { PresenceState, RemoteCommand, RemoteState } from '@shared/collab.js';
@@ -120,13 +120,25 @@ let role: PresentationRole = params.get('role') === 'speaker' ? 'speaker' : 'aud
 const bus = agentViewer ? null : createPresentationBus(deckId);
 
 /**
- * The talk's clips, downloaded once and played from memory. Safari keeps no
- * media bytes from one <video> to the next, so without this every visit to a
- * slide fetched its clips again (videoBlobCache.ts). Page-owned rather than
- * Player-owned, so a role swap hands the audience over with its clips. An
- * agent viewer takes screenshots, not a talk, and streams as before.
+ * The talk's clips and pictures, downloaded once and shown from memory.
+ * Safari keeps no media bytes from one <video> to the next, so without this
+ * every visit to a slide fetched its clips again; and a picture shown from
+ * the network is one the next reshow asks the server about again
+ * (mediaBlobCache.ts). Page-owned rather than Player-owned, so a role swap
+ * hands the audience over with its media. An agent viewer takes
+ * screenshots, not a talk, and streams as before.
  */
-const videoBlobs = agentViewer ? undefined : new VideoBlobCache({ borrow: borrowFromEditor() });
+const mediaBlobs = agentViewer ? undefined : new MediaBlobCache({ borrow: borrowFromEditor() });
+
+declare global {
+  interface Window {
+    /** Whether this presentation holds its whole talk in memory (see `mediaBlobs`). */
+    deckwerkPresentationMemory?: { holdsAll(): boolean };
+  }
+}
+// Read by whoever needs to know the talk can go on without the server (the
+// media budget suite cuts the link once it is true).
+if (mediaBlobs) window.deckwerkPresentationMemory = { holdsAll: () => mediaBlobs.holdsAll() };
 
 /**
  * The editor tab that embeds this presentation may already hold the talk's
@@ -284,7 +296,7 @@ function mountAudience(): void {
     container: stageHost,
     resolveSrc,
     onCursor: publishState,
-    videoBlobs,
+    mediaBlobs,
   });
   // Opening on a slide's first step plays what runs on arriving there, as
   // starting the show does; opening mid-slide resolves to that step.
@@ -314,7 +326,7 @@ function unmountAudience(): void {
   player?.destroy();
   player = null;
   // Speaker View plays nothing: keep what is in memory, fetch nothing more.
-  videoBlobs?.want([]);
+  mediaBlobs?.want([]);
   stageHost.replaceChildren();
   stageHost.hidden = true;
 }
