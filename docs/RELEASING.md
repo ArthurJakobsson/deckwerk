@@ -172,14 +172,85 @@ users can `sudo apt install ./deckwerk_<v>_amd64.deb`. There is no apt
 repository, so it does not update itself — Flathub is the auto-updating Linux
 channel.
 
-The macOS `.zip` files and the `latest*.yml` manifests exist for
-`electron-updater`, which is not wired up yet. They are cheap to keep
-producing and are what an in-app updater will need.
+## In-app updates
+
+The desktop app updates itself from GitHub Releases with `electron-updater`
+([`src/main/updates.ts`](../src/main/updates.ts)). **DeckWerk menu → Check for
+Updates…** (also under About in the macOS app menu) asks the feed; the app
+never checks by itself. A newer release is offered with its notes, and is
+downloaded only after **Update** is confirmed, with progress in the status
+bar. **Restart Now** first has every window save its deck, refusing while
+anything is unsaved, a presentation is on screen, or people are connected to
+a shared deck. **Later** installs nothing — not even on quit; the next Check
+for Updates offers the restart again.
+
+| Install | How it updates | What the app reads from the release |
+| --- | --- | --- |
+| macOS (dmg or Homebrew) | Squirrel.Mac, from the zip | `latest-mac.yml`, `deckwerk-<v>-mac-{arm64,x64}.zip` (+ `.blockmap`) |
+| Windows | NSIS, silent reinstall | `latest.yml`, `deckwerk-<v>-win-x64-setup.exe` (+ `.blockmap`) |
+| Linux AppImage (`$APPIMAGE` set) | replaces the AppImage | `latest-linux.yml`, `deckwerk-<v>-linux-x86_64.AppImage` |
+| Linux `.deb` / tar.gz | no self-update: the menu opens the release page | — |
+| Flatpak (`$FLATPAK_ID` set) | no self-update: the menu opens the release page (`flatpak update` once on Flathub) | — |
+| `npm run dev`, unpackaged | nothing; the menu says so | — |
+
+The workflow keeps the two macOS runners' manifests apart
+(`latest-mac-<arch>.yml`) and merges them into one `latest-mac.yml` naming
+both zips — electron-updater picks the one with `arm64` in its name on Apple
+silicon. `scripts/update-manifests.mjs check` then fails the release job,
+dry runs included, if any of the three manifests is missing or lists a file
+that is not attached with the sha512 it claims.
+
+The Homebrew cask declares `auto_updates true`, so `brew upgrade` leaves a
+self-updating install alone (`brew upgrade --greedy` still upgrades it).
+
+### Trying an update end to end
+
+`DECKWERK_UPDATE_FEED=<url>` points the updater at a generic feed — a folder
+of `latest*.yml` and installers served over HTTP — instead of GitHub, so an
+update can be tried from two dry-run builds without publishing anything.
+
+1. Run the workflow as a dry run (see the top of this file) at version *N*.
+   Download your platform's `installers-*` artifact and install that app. On
+   macOS move it to `/Applications` first: Squirrel.Mac cannot replace an app
+   that macOS is running from a translocated quarantine copy.
+2. On a scratch branch, bump `package.json` to a higher version (say
+   `npm version patch --no-git-tag-version`), push it, and run a second dry
+   run from that branch. Download its artifact into an empty folder `feed/`.
+   On macOS, the artifact's manifest is `latest-mac-<arch>.yml`: rename it
+   to `latest-mac.yml` (or merge both arches with
+   `node scripts/update-manifests.mjs merge-mac`).
+3. Serve it: `python3 -m http.server 8000 --directory feed`.
+4. Start the installed version-*N* app with the feed:
+   - macOS: `DECKWERK_UPDATE_FEED=http://127.0.0.1:8000/ /Applications/DeckWerk.app/Contents/MacOS/DeckWerk`
+   - Linux: `DECKWERK_UPDATE_FEED=http://127.0.0.1:8000/ ./deckwerk-<N>-linux-x86_64.AppImage`
+   - Windows (PowerShell): `$env:DECKWERK_UPDATE_FEED='http://127.0.0.1:8000/'; & "$env:LOCALAPPDATA\Programs\deckwerk\DeckWerk.exe"`
+5. **DeckWerk menu → Check for Updates…** → Update → Restart Now. The app
+   reopens; **About DeckWerk** shows the new version.
+
+The Linux leg of every release run does this for the AppImage by itself
+(**Check the AppImage updates itself**): it repackages the build as the next
+patch version into `update-smoke/` (never uploaded), serves it as the feed,
+and runs [`scripts/smoke-test-appimage-update.mjs`](../scripts/smoke-test-appimage-update.mjs)
+under Xvfb — Check for Updates…, Update, Restart Now — then checks the new AppImage
+replaced the old one and relaunched as the new version. A release whose
+AppImage cannot update itself fails there.
+
+Squirrel.Mac only installs an update signed by the same Developer ID as the
+running app, so on macOS both dry runs must have had the signing secrets.
+`test/updateCheckDesktopBrowser.test.ts` drives the same feed override against
+the unpackaged app for the check and its dialogs; the download and install
+are only exercised this way.
 
 ## Known gaps
 
 - **No Linux arm64.** Adding it means another matrix entry on an arm runner;
   nothing in the configuration assumes x64. Until then, arm64 Linux users
   build from source ([BUILDING.md](BUILDING.md)).
-- **No auto-update.** `electron-updater` is not installed. The metadata it
-  needs is already being produced.
+- **Windows updates are unsigned.** Until Azure Trusted Signing is live the
+  installer electron-updater downloads is unsigned, and it checks no
+  publisher. Once signing lands, check that the generated `app-update.yml`
+  carries the certificate's `publisherName`, or updates will be accepted from
+  any signer.
+- **No self-update for the `.deb`.** It belongs to dpkg; the menu opens the
+  release page instead. An apt repository would make `apt upgrade` the
+  update path.

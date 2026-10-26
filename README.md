@@ -40,6 +40,12 @@ sudo apt install ./deckwerk_*_amd64.deb
 **Windows** — download the `setup.exe` from the
 [latest release](https://github.com/vsitzmann/deckwerk/releases/latest).
 
+**Updating** — DeckWerk never updates, or even checks, on its own. Choose
+**DeckWerk menu → Check for Updates…**: if a newer release exists, the macOS,
+Windows and AppImage builds show what is new and update after you confirm,
+restarting when you say so. The `.deb` does not replace itself, and neither
+does a Flatpak: for those the menu item opens the release page.
+
 **From source** — you will need [Node.js](https://nodejs.org/) 22 or newer,
 Python 3.10 or newer, and Git:
 
