@@ -39,6 +39,12 @@ import type { RemoteHistoryOptions } from '../editor/store.js';
  */
 
 const UNDO_LIMIT = 200;
+/**
+ * A socket that has not opened by now is given up and retried. A server
+ * behind a route that dropped (a tailnet link gone) never refuses: without
+ * this the handshake hangs for minutes, and nothing says the session is down.
+ */
+const CONNECT_TIMEOUT_MS = 10_000;
 
 interface UndoEntry {
   label: string;
@@ -101,6 +107,8 @@ export interface CollabBridgeHooks {
   onEditsDiscarded?: (count: number) => void;
   /** A message about the remote (remoteControl.ts), from the one peer it is shared with. */
   onRemote?: (message: ServerRemoteMessage) => void;
+  /** The server refuses this person the deck (close 4003); the bridge has stopped. */
+  onAccessRevoked?: () => void;
 }
 
 /** How this peer introduces itself beyond its name: see PresenceState. */
@@ -152,11 +160,21 @@ export class CollabBridge {
     this.surface = surface;
   }
 
+  /** Whether the socket is open: the server is reachable, whether or not it has welcomed us yet. */
+  get open(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
+
   connect(): void {
     this.closed = false;
     const socket = new WebSocket(this.url);
     this.socket = socket;
+    const handshake = setTimeout(() => {
+      if (socket.readyState === WebSocket.CONNECTING) socket.close();
+    }, CONNECT_TIMEOUT_MS);
+    socket.addEventListener('close', () => clearTimeout(handshake));
     socket.addEventListener('open', () => {
+      clearTimeout(handshake);
       this.reconnectDelay = 500;
       this.send({
         kind: 'hello',
@@ -183,6 +201,7 @@ export class CollabBridge {
       if (event.code === 4003) {
         this.closed = true;
         this.hooks.onStatus(event.reason || 'You no longer have access to this presentation');
+        this.hooks.onAccessRevoked?.();
         return;
       }
       // A deck that is not there (or was renamed: that close follows a

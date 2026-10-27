@@ -53,6 +53,18 @@ import { createDeckOnServer, folderOf, importKeynoteToServer, importPowerPointTo
 import { downloadOriginalAsset, installNetApi } from './netApi.js';
 import { installWindowApiPosterProvider } from '../player/previewPosterProvider.js';
 import { installEditorVideoMemory } from './editorVideoMemory.js';
+import { OfflineCopy } from './offlineCopy.js';
+import { KEPT_HEADER } from './offlineShared.js';
+import { offlineWorker, registerOfflineShell } from './offlineShell.js';
+import {
+  isMediaPending,
+  mediaVariantsSnapshot,
+  pendingMediaSnapshot,
+  setMediaVariants,
+  setPendingMedia,
+} from './mediaVariants.js';
+import { gatedLoadsPending } from '../player/mediaLoadGate.js';
+import { mediaStackReusesBytes } from '../player/videoMemory.js';
 import { PresenceOverlay } from './presenceOverlay.js';
 import { PresenceBar, isAgentPeer } from './presenceBar.js';
 import { ChatPanel } from './chatPanel.js';
@@ -64,7 +76,7 @@ import { AgentPanel } from '../editor/agentPanel.js';
 import { agentConnectPrompt } from './agentPrompt.js';
 import { RemoteReceiver } from './remoteControl.js';
 import { isPhone, rememberShell, shellUrl, wantsMobileShell } from './mobileShell.js';
-import { startPresenting } from './presentOverlay.js';
+import { isPresenting, startPresenting } from './presentOverlay.js';
 import { rangeForSlideSelection } from '@shared/presentationRange.js';
 import { setRenderInvariantChecks } from '../editor/renderInvariants.js';
 import { setSelectionInvariantChecks } from '../editor/selectionInvariants.js';
@@ -166,17 +178,47 @@ interface ServerConfig {
   access?: null | { user: string; name: string; admin: boolean; deckRole?: 'owner' | 'edit' | 'view' | null };
 }
 
+const CONFIG_TIMEOUT_MS = 5_000;
+/** The server did not answer for the config: the deck opens from the offline copy without waiting for the socket. */
+let serverUnanswered = false;
+
 let serverConfig: ServerConfig = { hosted: false, deckId: null, urls: [], agentPanel: null, access: null };
 
 async function fetchServerConfig(deck?: string | null): Promise<ServerConfig> {
+  const remembered = `deckwerk-config:${deck ?? ''}`;
   try {
-    const response = await fetch(deck ? `/api/config?deck=${encodeURIComponent(deck)}` : '/api/config');
-    if (response.ok) return await response.json() as ServerConfig;
+    // A server behind a dropped route never answers: the editor must still
+    // connect (and fail), so that it can open its offline copy.
+    const response = await fetch(deck ? `/api/config?deck=${encodeURIComponent(deck)}` : '/api/config', {
+      signal: AbortSignal.timeout(CONFIG_TIMEOUT_MS),
+    });
+    if (response.ok) {
+      const config = await response.json() as ServerConfig;
+      // The service worker's kept answer: the server did not answer it.
+      if (response.headers.get(KEPT_HEADER)) {
+        serverUnanswered = true;
+        return config;
+      }
+      try {
+        localStorage.setItem(remembered, JSON.stringify(config));
+      } catch {
+        // Storage refused: the next offline open asks as a stranger would.
+      }
+      return config;
+    }
     // Refused for this deck (no access): the server-wide answer still says
     // what kind of server this is; the socket will say the rest.
     if (deck) return await fetchServerConfig(null);
   } catch {
-    // Older server without /api/config; behave like the multi-deck server.
+    // No server (the offline copy opens with what it said last time), or an
+    // older one without /api/config: behave like the multi-deck server.
+    serverUnanswered = true;
+    try {
+      const last = localStorage.getItem(remembered);
+      if (last) return JSON.parse(last) as ServerConfig;
+    } catch {
+      // Nothing remembered.
+    }
   }
   return { hosted: false, deckId: null, urls: [], agentPanel: null, access: null };
 }
@@ -247,9 +289,11 @@ installNetApi({ deckId, saveTheme: (css) => bridge.sendTheme(css) });
 installWindowApiPosterProvider();
 // Safari re-downloads a clip for every element that opens it: the canvas
 // reads clips from memory there (editorVideoMemory.ts).
-installEditorVideoMemory(deckId);
+const videoMemory = installEditorVideoMemory(deckId);
 
 const store = new EditorStore(emptyDeck('Connecting…'));
+/** The offline copy (offlineCopy.ts), once the deck is open; null where none can be kept. */
+let offline: OfflineCopy | null = null;
 // The colour picker offers the colours already on the slide being edited.
 setSlideColorSource(() => slideColors(store.slide));
 // Development builds verify after every in-place patch that the canvas DOM
@@ -314,7 +358,143 @@ const cssEditor = new CssEditor(cssHost);
 cssEditor.onChange = () => {
   canvas.refitAutoText();
   inspector.noteThemeChanged();
+  offline?.deckChanged();
 };
+
+/* --- offline copy ------------------------------------------------------------ */
+
+/**
+ * Whether the editor is fetching what it shows, or presenting. The offline
+ * copy downloads only while it is not, so it never competes with the slide
+ * somebody is looking at.
+ */
+function editorFetching(): boolean {
+  if (isPresenting() || gatedLoadsPending() || videoMemory?.transferring()) return true;
+  for (const video of el('canvas').querySelectorAll('video')) {
+    if (video.networkState === HTMLMediaElement.NETWORK_LOADING && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return true;
+  }
+  for (const image of el('canvas').querySelectorAll('img')) if (!image.complete) return true;
+  return false;
+}
+
+if (OfflineCopy.supported()) {
+  offline = new OfflineCopy({
+    deckId,
+    deck: () => store.get().deck,
+    slideIndex: () => store.get().slideIndex,
+    themeCss: () => cssEditor.getValue(),
+    mediaVariants: mediaVariantsSnapshot,
+    pendingMedia: pendingMediaSnapshot,
+    resolveSrc: (src) => window.api.assetUrl(src),
+    isPending: isMediaPending,
+    busy: editorFetching,
+    borrow: videoMemory ? (url) => videoMemory.objectUrl(url) : undefined,
+    rangeReuse: mediaStackReusesBytes(),
+    onChange: () => renderStatus(),
+    storage: navigator.storage,
+    worker: offlineWorker,
+  });
+  // The presentation this tab embeds, and the video memory, fetch through it
+  // (present.ts, editorVideoMemory.ts), so a file is never downloaded twice.
+  window.deckwerkOffline = offline;
+}
+
+// The worker took charge of this page: downloads read back through it can start.
+navigator.serviceWorker?.addEventListener('controllerchange', () => offline?.resume());
+
+// A snapshot due in a moment is written now if the page goes away: a deck
+// closed right after an edit still opens without the server as it was.
+window.addEventListener('pagehide', () => offline?.flushSnapshot());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') offline?.flushSnapshot();
+});
+
+let offlineStarted = false;
+/** 'pending' while the worker is being installed, 'retry' once an attempt failed. */
+let shellInstall: 'idle' | 'pending' | 'retry' | 'done' = 'idle';
+/** The deck is open: keep a copy of it, and install the worker that answers from it. */
+function startOffline(): void {
+  if (!offline || offlineStarted) return;
+  offlineStarted = true;
+  offline.start();
+  // A worker already controls this page (it loaded the page, perhaps without
+  // a server): the shell is there now, and registering again only updates it.
+  if (navigator.serviceWorker?.controller) offline.setShellReady(true);
+  installShell();
+}
+
+/**
+ * Install (or update) the worker. An attempt the connection cut short is
+ * tried again when the editor reconnects: without it, a deck opened just
+ * before the link dropped could never be presented offline that session.
+ */
+function installShell(): void {
+  if (!offline || shellInstall === 'pending' || shellInstall === 'done') return;
+  shellInstall = 'pending';
+  void registerOfflineShell(editorFetching).then((result) => {
+    shellInstall = result === 'failed' ? 'retry' : 'done';
+    if (result === 'failed') return;
+    if (result === 'ready' || !navigator.serviceWorker?.controller) offline?.setShellReady(result === 'ready');
+  });
+}
+
+/**
+ * Opened without a server: show the deck as it was last seen here. Edits
+ * made now are kept on screen and dropped when the server answers, exactly
+ * as edits made during any disconnection are (collabBridge.ts).
+ */
+const READ_ONLY_COPY = 'Read-only: editing comes back when the server answers, since changes made to this copy could not be saved.';
+
+/**
+ * The deck on screen is the copy kept in this browser: anything edited in it
+ * would be discarded when the server answers (the bridge drops unconfirmed
+ * edits on reconnect). So it is read-only until then: the store refuses
+ * every edit and says why, the canvas and the side panels take no input
+ * (`inert`), and the rail hides its edit buttons. The rail still moves
+ * between slides, and Present still works.
+ */
+function lockOfflineCopy(on: boolean): void {
+  store.setEditLock(on ? READ_ONLY_COPY : null);
+  el('canvas').inert = on;
+  el('side').inert = on;
+  if (on) document.documentElement.dataset.readOnlyCopy = 'true';
+  else delete document.documentElement.dataset.readOnlyCopy;
+  // The banner names what still works; say it again in the new terms.
+  if (connectionNotice.state() === 'disconnected') connectionNotice.showDisconnected();
+}
+store.onEditRefused = (reason) => {
+  if (!statusMessage.endsWith(reason)) setStatusMessage(reason);
+};
+
+/**
+ * A server that has not even accepted the connection by now is as good as
+ * gone for opening the deck: show the offline copy rather than "Connecting…"
+ * for as long as an unanswered handshake takes. At once without a network.
+ */
+const OFFLINE_OPEN_DELAY_MS = 4_000;
+setTimeout(() => {
+  if (!welcomed && !bridge.open) void openOfflineCopy();
+}, navigator.onLine === false ? 0 : OFFLINE_OPEN_DELAY_MS);
+
+async function openOfflineCopy(): Promise<void> {
+  if (!offline || welcomed || shownOffline) return;
+  const snapshot = await OfflineCopy.loadSnapshot(deckId!);
+  if (!snapshot || welcomed || shownOffline) return;
+  shownOffline = true;
+  setMediaVariants(snapshot.mediaVariants, true);
+  setPendingMedia(snapshot.pendingMedia);
+  store.load(snapshot.deck, `(offline) ${deckId}`, { keepView: true });
+  if (initialViewPending) {
+    restoreEditorView(store, initialView);
+    initialViewPending = false;
+  }
+  cssEditor.setValue(snapshot.themeCss);
+  themePanel.noteDeckOpened(snapshot.deck);
+  document.documentElement.dataset.offlineDeck = 'true';
+  lockOfflineCopy(true);
+  setStatusMessage(`Offline: showing the copy kept in this browser (${new Date(snapshot.savedAt).toLocaleString()}). ${READ_ONLY_COPY}`);
+  startOffline();
+}
 // The documented HTML-first surface and visible agent workspace share this
 // compiler and the live theme buffer.
 const presence = new PresenceOverlay(canvas, store);
@@ -452,6 +632,8 @@ el('themePanel').classList.add('theme-panel');
 let connectionState = 'connecting…';
 /** Whether a welcome has already been handled, i.e. later ones are reconnects. */
 let welcomed = false;
+/** Whether the deck on screen came from the offline copy, the server being unreachable at open. */
+let shownOffline = false;
 /** Live connection state; gates the actions that need the server (Present, export). */
 let connected = false;
 
@@ -469,6 +651,8 @@ const connectionNotice = createConnectionNotice({
       2,
     ),
   }),
+  presentsOffline: () => offline?.ready() ?? false,
+  readOnlyCopy: () => shownOffline,
 });
 
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?deck=${encodeURIComponent(deckId)}`;
@@ -490,9 +674,12 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     connectionState = `connected as ${welcome.self.name}`;
     // The first welcome opens the document; every later one is a reconnect of
     // the same session, where the revision log and the selection must survive.
-    if (welcomed) store.resyncRemote(welcome.deck, `(collab) ${deckId}`);
+    if (welcomed || shownOffline) store.resyncRemote(welcome.deck, `(collab) ${deckId}`);
     else store.load(welcome.deck, `(collab) ${deckId}`, { keepView: true });
     welcomed = true;
+    if (shownOffline) lockOfflineCopy(false);
+    shownOffline = false;
+    delete document.documentElement.dataset.offlineDeck;
     if (initialViewPending) {
       restoreEditorView(store, initialView);
       initialViewPending = false;
@@ -512,6 +699,10 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     rail.refreshPresence();
     renderStatus();
     document.documentElement.dataset.collabReady = 'true';
+    // Counted, so a test can tell a fresh welcome from a flag never cleared.
+    document.documentElement.dataset.collabWelcomes = String(Number(document.documentElement.dataset.collabWelcomes ?? 0) + 1);
+    startOffline();
+    offline?.deckChanged();
   },
   onDeckReplaced: (deck, label, options) => {
     store.applyRemote(deck, label, options);
@@ -526,7 +717,10 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     presence.remove(clientId);
     rail.refreshPresence();
   },
-  onMediaVariants: (srcs) => canvas.refreshMediaSources(srcs),
+  onMediaVariants: (srcs) => {
+    canvas.refreshMediaSources(srcs);
+    offline?.deckChanged();
+  },
   onThemeCss: (css) => {
     // Never yank the CodeMirror buffer out from under someone typing in it.
     if (!cssEditor.hasFocus() && css !== cssEditor.getValue()) cssEditor.setValue(css);
@@ -542,12 +736,16 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     connected = isConnected;
     if (isConnected) {
       connectionNotice.hide();
+      offline?.resume();
+      if (shellInstall === 'retry') installShell();
       // The refusal is moot once the server is back; don't leave it lingering.
-      if (statusMessage === PRESENT_NEEDS_SERVER) setStatusMessage('');
+      if (statusMessage.startsWith(PRESENT_NEEDS_SERVER)) setStatusMessage('');
     } else {
       delete document.documentElement.dataset.collabReady;
       connectionNotice.showDisconnected();
       remote.disconnected();
+      // Opened while the server is unreachable: show the copy kept here.
+      if (!welcomed) void openOfflineCopy();
     }
   },
   onEditsDiscarded: (count) => {
@@ -567,7 +765,10 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     connected = false;
     setStatusMessage(reason);
     connectionNotice.showEnded(reason);
+    // Gone, or no longer this person's to open: keep nothing of it here.
+    void offline?.forget();
   },
+  onAccessRevoked: () => void offline?.forget(),
   onRemote: (message) => remote.handle(message),
 });
 
@@ -596,8 +797,9 @@ const shellDeps: ShellDeps = {
   currentThemeCss: () => cssEditor.getValue(),
   // The browser's own downloads show progress and where the file went.
   downloadOriginal: { label: 'Download original', run: (element) => downloadOriginalAsset(deckId!, element.src) },
-  undo: () => bridge.undo(store.get().deck),
-  redo: () => bridge.redo(store.get().deck),
+  // Collab undo goes through the bridge, not the store's edit path: refused here.
+  undo: () => (store.editLocked ? setStatusMessage(store.editLocked) : bridge.undo(store.get().deck)),
+  redo: () => (store.editLocked ? setStatusMessage(store.editLocked) : bridge.redo(store.get().deck)),
 };
 const clipboard = createClipboardActions(shellDeps);
 bindEditorKeys(shellDeps, clipboard);
@@ -678,6 +880,9 @@ store.subscribe(() => {
   // Slide numbers in the chat follow the deck; skip the work on selection churn.
   const { deck, slideIndex } = store.get();
   if (deck !== chatDeck || slideIndex !== chatSlideIndex) {
+    // The offline copy keeps the deck, and downloads outward from the slide shown.
+    if (deck !== chatDeck) offline?.deckChanged();
+    else offline?.slideChanged();
     chatDeck = deck;
     chatSlideIndex = slideIndex;
     chatPanel.refresh();
@@ -751,10 +956,15 @@ async function exportPdf(): Promise<void> {
  */
 function startPresentation(speakerView = false): void {
   // present.html and its bundle are served by the collab server; with the
-  // server gone the iframe would load nothing — a white overlay with no
-  // explanation. Refuse with the reason instead.
-  if (!connected) {
-    setStatusMessage(PRESENT_NEEDS_SERVER);
+  // server gone the iframe loads them from the offline copy (sw.ts), and the
+  // deck's files from there too. Without a complete copy it would show a
+  // white overlay, or slides missing their pictures: refuse with the reason.
+  if (!connected && !offline?.ready()) {
+    // Say what is missing when it is the offline copy, not just the server.
+    const copy = offline?.statusText() ?? '';
+    setStatusMessage(copy && copy !== 'Available offline'
+      ? `${PRESENT_NEEDS_SERVER} This browser does not hold the whole talk (${copy.charAt(0).toLowerCase()}${copy.slice(1)}).`
+      : PRESENT_NEEDS_SERVER);
     connectionNotice.showDisconnected();
     return;
   }
@@ -1181,6 +1391,9 @@ function renderStatus(): void {
   if (slideSelection.size > 1) bits.push(`${slideSelection.size} slides selected`);
   if (selection.size > 0) bits.push(`${selection.size} selected`);
   if (dirty) bits.push('syncing…');
+  const offlineText = offline?.statusText();
+  if (offlineText) bits.push(offlineText);
+  document.documentElement.dataset.offline = offline?.status().state ?? 'unavailable';
   if (statusMessage) bits.push(statusMessage);
   // In a hosted session, keep the invite address visible so anyone at the
   // machine can read it out — the LAN/tailscale URL, not loopback.
@@ -1198,6 +1411,7 @@ function renderStatus(): void {
 // before first paint of the buttons keeps New/Open/Import from flashing in.
 void fetchServerConfig(deckId).then((config) => {
   serverConfig = config;
+  if (serverUnanswered) void openOfflineCopy();
   if (config.agentPanel?.enabled && !agentPanel) {
     agentPanelBrowserApi = createAgentPanelApi(deckId!);
     const local = config.agentPanel.mode === 'local';
