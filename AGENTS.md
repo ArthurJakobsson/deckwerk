@@ -277,7 +277,9 @@ turns into, not a list of things to opt into.
   `&nbsp;` are kept; `<ol start>` and `<li value>` number as in HTML. A hand-written
   `<table>` becomes an editable deck table with the column widths the browser
   measured, read per column from the cells' grid, so `<col>` widths and cell
-  widths survive a group-header first row of `colspan` cells. The player
+  widths survive a group-header first row of `colspan` cells. Write a new
+  table in a `slide-agent new` page: one written into an exported section
+  stays an HTML region (`apply` says so). The player
   draws an unstyled table as a plain 1px grid; a designed table resets that first (`.results th, .results td { border: 0 }`
   in `theme.css`) and then adds only the rules it wants.
 - **Maths** — `$…$` inline, `$$…$$` display, KaTeX TeX inside any text; the
@@ -307,6 +309,12 @@ turns into, not a list of things to opt into.
   primitive (`rect`, `circle`, `ellipse`, `line`, `path`, `polygon`,
   `polyline`) becomes that shape: a `<line>` with `marker-end` is a real
   arrow, angle and all, and a single `<path>` keeps its `d` and its viewBox.
+  A `stroke-dasharray` becomes the deck's dashed stroke, or its dotted one
+  when the dashes are no longer than the line is wide; `stroke-opacity` and
+  `fill-opacity` fold into the colours' alpha, and `opacity` onto the object.
+  All of this holds for markup you write fresh into an exported section too:
+  only the objects the page was exported with (`data-element-id`) come back
+  exactly as they went out.
   An exported line or arrow says its bend as `data-control-offset="dx,dy"`,
   relative to its box's top-left corner, so moving it by `left`/`top` moves
   the bend too; delete the attribute to straighten it.
@@ -334,8 +342,8 @@ turns into, not a list of things to opt into.
 ### What to avoid
 
 These still import, but as an inert `data-element="html"` region — movable and
-resizable, editable only by rewriting the markup (`validate` lists them as
-`importGaps`):
+resizable, editable only by rewriting the markup. `apply` warns about each one
+it made, saying why, and `validate` lists them as `importGaps`:
 
 - **A multi-primitive inline SVG.** A boxes-and-arrows diagram drawn as one
   `<svg>` is a picture to the deck. Build it from divs and one-primitive SVGs
@@ -727,6 +735,8 @@ For each gap, export its slide with `inspect --html --slide <id|number>`, replac
 conspicuous `data-element="unsupported"` placeholder with real HTML, and save.
 The replacement becomes an editable text, media, shape, or HTML object on the
 way back; a clean `importGaps: []` confirms that the repair loop is complete.
+An HTML region a compile fell back to (`originalType: "html"`, its reason in
+`note`) is listed too; one you declared with `data-element="html"` is not.
 
 ### Make or change a theme
 
